@@ -1,0 +1,210 @@
+ada revactor dan strict typing
+================================================================
+  CATATAN PEMBARUAN SISTEM BOT TRADING
+  Tanggal: April 2026
+  Versi  : 2.0 (Production-Ready Patch)
+================================================================
+
+Dokumen ini menjelaskan semua perubahan yang dilakukan pada sesi
+pengembangan ini, mencakup perbaikan bug kritis, peningkatan
+keamanan, dan fitur baru yang ditambahkan.
+
+----------------------------------------------------------------
+BAGIAN 1 — PERBAIKAN BUG KRITIS (execution.py)
+----------------------------------------------------------------
+
+[BUG #1] hmac.new() — Kompatibilitas Python 3.12+
+  File    : execution.py
+  Masalah : Penggunaan hmac.new() yang mulai dianggap tidak
+            standar di Python versi terbaru.
+  Solusi  : Diganti ke hmac.HMAC() yang merupakan cara resmi
+            dan lebih eksplisit sesuai standar Python 3.12+.
+  Dampak  : Bot tidak akan crash karena perubahan API Python
+            di versi mendatang.
+
+[BUG #2] asyncio.ensure_future() — Task Hilang Saat Shutdown
+  File    : execution.py (fungsi place_order)
+  Masalah : Menggunakan asyncio.get_event_loop() dan
+            asyncio.ensure_future() yang sudah deprecated.
+            Task order bisa "lolos" dari mekanisme cleanup
+            saat bot dimatikan, menyebabkan order tidak
+            terselesaikan dengan benar.
+  Solusi  : Diganti ke asyncio.get_running_loop() +
+            loop.create_task() agar task terdaftar secara
+            resmi dan bisa di-cleanup saat shutdown.
+  Dampak  : Order tidak akan hilang di tengah jalan saat
+            bot dihentikan. Kode juga menjadi 15 baris → 6
+            baris, jauh lebih bersih.
+
+[BUG #3] entry_time Tidak Dipulihkan Setelah Restart
+  File    : strategy.py (fungsi on_tick)
+  Masalah : Ketika bot di-restart dengan posisi yang masih
+            terbuka, bot bisa memulihkan entry_price dari
+            position_manager. Namun entry_time (waktu posisi
+            dibuka) tidak dipulihkan.
+            Akibatnya: fitur Time Stop (otomatis tutup posisi
+            jika terlalu lama) tidak pernah terpicu setelah
+            restart, dan posisi bisa parkir selamanya.
+  Solusi  : Sinkronisasi sekarang juga memulihkan entry_time
+            dari position_manager.open_time.
+            Ditambahkan juga: reset entry_time ke 0 saat
+            posisi ditutup agar Time Stop tidak terpicu palsu.
+  Dampak  : Time Stop bekerja normal bahkan setelah restart.
+
+[BUG #4] reduceOnly Ditolak di Bybit Hedge Mode
+  File    : execution.py (fungsi _live_place_order_async)
+  Masalah : Bot selalu mengirim flag reduceOnly: True saat
+            menutup posisi. Bybit menolak flag ini (retCode
+            10001) jika akun diset ke Hedge Mode.
+            Akibatnya: posisi gagal ditutup tanpa pesan error
+            yang jelas.
+  Solusi  : Saat API Bybit mengembalikan retCode 10001,
+            sistem otomatis menghapus flag reduceOnly lalu
+            langsung retry tanpa delay. Log akan menampilkan
+            peringatan "Hedge Mode terdeteksi".
+  Dampak  : Bot kompatibel dengan akun One-Way maupun
+            Hedge Mode tanpa konfigurasi manual.
+
+----------------------------------------------------------------
+BAGIAN 2 — FITUR BARU: VALIDASI OTOMATIS SEBELUM BOT JALAN
+----------------------------------------------------------------
+
+[FITUR] preflight_check.py — 16 Pengecekan Otomatis
+  File    : preflight_check.py
+  
+  Sistem validasi strategy.py diperluas dari 6 menjadi 16
+  pengecekan. Terbagi dua level:
+
+  ❌ ERROR FATAL (bot diblokir, harus diperbaiki dulu):
+  ───────────────────────────────────────────────────────
+  Cek  1: File strategy.py ada
+  Cek  2: Sintaks Python valid (tidak ada typo/indentasi salah)
+  Cek  3: Semua library yang di-import sudah ter-install
+  Cek  4: Fungsi generate_signal() ada dan callable
+  Cek  5: generate_signal() bisa dijalankan tanpa crash
+           dengan data dummy 100 candle
+  Cek  6: Return value adalah dict dengan key "action"
+           berisi "buy"/"sell"/"close"/"hold"
+  Cek  7: Fungsi on_tick() ada (dipanggil main.py tiap tick)
+  Cek  8: generate_signal() return "hold" saat is_warmup=True
+           (tidak boleh entry saat data historis belum penuh)
+  Cek 10: generate_signal() selesai dalam < 5 detik
+           (lebih lama = event loop membeku)
+  Cek 11: on_tick() memanggil execution.place_order()
+           (tanpa ini, sinyal tidak pernah dikirim ke Bybit)
+  Cek 12: Tidak ada time.sleep() dalam generate_signal()
+           (memblokir asyncio event loop)
+  Cek 14: Tidak ada sys.exit()/exit()/quit() di strategy.py
+           (mematikan bot tanpa sempat tutup posisi)
+
+  ⚠️ SARAN / WARNING (bot tetap bisa jalan, hanya diingatkan):
+  ───────────────────────────────────────────────────────
+  Cek  9: generate_signal() tidak selalu return non-hold
+           (saran: verifikasi filter kondisi entry-nya)
+  Cek 13: Tidak ada HTTP request di generate_signal()
+           (saran: pindah ke background task)
+  Cek 15: Tidak ada file I/O di generate_signal()
+           (saran: baca file di level modul, bukan di fungsi)
+  Cek 16: generate_signal() tidak crash saat data parsial
+           (saran: tambah guard untuk field yang mungkin kosong)
+
+  Cara pakai (CLI):
+    python preflight_check.py
+
+  Cara pakai (Streamlit):
+    Otomatis berjalan saat klik ▶️ Start Bot di Control Panel
+
+[FITUR] 2_control_panel.py — Validasi Terintegrasi di UI
+  File    : pages/2_control_panel.py
+
+  Perubahan pada halaman Control Panel di Streamlit:
+
+  1. Validasi Otomatis Saat Start Bot
+     Saat tombol ▶️ Start Bot diklik, sistem TIDAK langsung
+     menjalankan bot. Pertama, akan menjalankan semua 16
+     pengecekan preflight. Hasilnya:
+     - Jika ada ERROR FATAL → bot tidak jalan, error
+       ditampilkan dalam expander merah yang terbuka.
+     - Jika ada WARNING    → ditampilkan dalam expander
+       kuning yang tertutup (bisa diabaikan).
+     - Jika semua OK       → bot dinyalakan otomatis.
+
+  2. Panel Validasi Manual
+     Ada expander "🔍 Jalankan validasi manual" yang bisa
+     dipakai kapan saja untuk cek strategy.py tanpa harus
+     menekan Start Bot. Berguna saat sedang mengedit strategi.
+
+  3. Perbaikan Fixed Path
+     bot_pid.txt dan pemanggilan main.py sekarang menggunakan
+     path absolut, sehingga bekerja benar meskipun Streamlit
+     dijalankan dari direktori yang berbeda.
+
+----------------------------------------------------------------
+BAGIAN 3 — PEMBARUAN DOKUMENTASI
+----------------------------------------------------------------
+
+[DOCS] README.md
+  - Bagian "Validasi strategy.py" diperbarui dengan tabel
+    penjelasan 2 level (Error Fatal vs Saran)
+  - Ditambahkan catatan bahwa validasi bisa dilakukan dari
+    Control Panel tanpa perlu buka terminal
+  - Struktur file diperbarui:
+    + .env.example  (template API Key)
+    + bot_monitor.py (health monitor)
+    + bot_health.json (auto-generated)
+    + 2_control_panel.py deskripsi diperbarui
+
+----------------------------------------------------------------
+BAGIAN 4 — RINGKASAN FILE YANG DIUBAH
+----------------------------------------------------------------
+
+  execution.py
+    - hmac.new() → hmac.HMAC()
+    - asyncio event loop pattern diperbaiki
+    - Penanganan retCode 10001 (Hedge Mode)
+
+  strategy.py
+    - Pemulihan entry_time setelah restart
+    - Reset entry_time saat posisi ditutup
+
+  preflight_check.py
+    - Tambah Cek 7-16 (semula hanya 1-6)
+    - validate_strategy() sekarang return tuple (errors, warnings)
+    - run() tetap backward compatible (hanya return errors)
+    - run_and_print() tampilkan errors + warnings terpisah
+
+  pages/2_control_panel.py
+    - Validasi otomatis sebelum Start Bot
+    - Panel validasi manual
+    - Fixed path untuk bot_pid.txt dan main.py
+
+  README.md
+    - Update bagian validasi, file structure, dan catatan run
+
+----------------------------------------------------------------
+CATATAN UNTUK DEVELOPER STRATEGY
+----------------------------------------------------------------
+
+Jika Anda menulis strategy.py baru, pastikan:
+
+  WAJIB ADA:
+  - def generate_signal(data: dict) -> dict:
+  - def on_tick(data: dict):  — harus panggil execution.place_order()
+
+  WAJIB DI AWAL generate_signal():
+  - if data.get("is_warmup", True):
+        return {"action": "hold", "reason": "Warmup"}
+
+  DILARANG DI generate_signal():
+  - time.sleep() atau sleep()
+  - sys.exit() / exit() / quit()
+
+  TIDAK MASALAH (warning saja, bot tetap jalan):
+  - HTTP request (requests.get, aiohttp) — tapi berisiko lambat
+  - Baca/tulis file (open, read_csv) — lebih baik di level modul
+  - Strategy agresif yang sering entry
+
+================================================================
+  Semoga membantu! Jalankan: python preflight_check.py
+  untuk memastikan strategy.py Anda siap sebelum live trading.
+================================================================

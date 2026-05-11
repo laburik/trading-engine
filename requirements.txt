@@ -1,0 +1,13 @@
+# Trading Bot Requirements
+# Python 3.10+
+
+# === Core Async ===
+aiohttp>=3.9.0         # WebSocket client + async HTTP
+
+# === Dashboard ===
+streamlit>=1.32.0      # Monitoring dashboard
+pandas>=2.0.0          # CSV loading + data manipulation
+sortedcontainers>=2.4.0 # Optimized dictionary operations
+
+# === Standard library (no install needed) ===
+# asyncio, json, csv, os, time, hmac, hashlib, uuid, threading, queue, collections, logging

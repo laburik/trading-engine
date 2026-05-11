@@ -1,0 +1,52 @@
+# ─── KEAMANAN — JANGAN PERNAH PUSH ───────────────────────────────────────────
+.env                   # API Key Bybit kamu ada di sini
+*.env
+*.key
+*.secret
+
+# ─── PYTHON ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ─── VIRTUAL ENVIRONMENT ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── DATA YANG DI-GENERATE OTOMATIS (tidak perlu di-push) ────────────────────
+trade_history.csv
+equity_curve.csv
+heartbeat.json
+bot_health.json
+bot_pid.txt
+*.log
+
+# ─── MODEL ML (file besar, opsional di-push) ──────────────────────────────────
+# Uncomment baris di bawah jika TIDAK ingin push model ML ke GitHub
+# (disarankan jika ukurannya > 50MB)
+# *.pkl
+
+# ─── MYPY & IDE ───────────────────────────────────────────────────────────────
+.mypy_cache/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── PYTEST / TEST ARTIFACTS ──────────────────────────────────────────────────
+.pytest_cache/
+htmlcov/
+.coverage
+
+# ─── STREAMLIT ────────────────────────────────────────────────────────────────
+.streamlit/secrets.toml
