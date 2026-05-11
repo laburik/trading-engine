@@ -37,11 +37,24 @@ def _get_saved_pid() -> int | None:
     return None
 
 def _pid_is_running(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError, OSError):
-        return False
+    if os.name == "nt":
+        # Windows: os.kill(pid, 0) kirim CTRL_C_EVENT (signal 0) yang mematikan proses!
+        # Gunakan tasklist untuk cek apakah PID masih hidup tanpa menyentuhnya.
+        try:
+            output = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                stderr=subprocess.DEVNULL,
+            ).decode(errors="ignore")
+            return str(pid) in output
+        except Exception:
+            return False
+    else:
+        # Unix/Linux: signal 0 aman — hanya cek keberadaan proses
+        try:
+            os.kill(pid, 0)
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
 
 def bot_process_running() -> bool:
     pid = _get_saved_pid()
