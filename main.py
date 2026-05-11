@@ -18,6 +18,12 @@ import logging
 import signal as _signal
 import sys
 import time as _time
+
+# Force UTF-8 output on Windows terminals (prevents UnicodeEncodeError from emoji)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from typing import TYPE_CHECKING, Optional
 import aiohttp
 from config import SYMBOL, MODE, REST_MARKET_URL, TIMEFRAMES, DATA_MODE
