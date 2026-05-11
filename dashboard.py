@@ -35,7 +35,7 @@ st.markdown("""
 # =============================================================================
 # DYNAMIC PATH LOADERS
 # =============================================================================
-@st.cache_data(ttl=1)
+@st.cache_data(ttl=5)
 def load_trade_history(path: str) -> pd.DataFrame:
     file = os.path.join(path, "trade_history.csv")
     if not os.path.exists(file):
@@ -48,7 +48,7 @@ def load_trade_history(path: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=1)
+@st.cache_data(ttl=5)
 def load_equity_curve(path: str) -> pd.DataFrame:
     file = os.path.join(path, "equity_curve.csv")
     if not os.path.exists(file):
@@ -75,7 +75,7 @@ def bot_is_online(heartbeat: dict) -> bool:
     last = heartbeat.get("last_update", 0)
     return (time.time() - last) < HEARTBEAT_TIMEOUT_SEC
 
-@st.cache_data(ttl=2, show_spinner=False)
+@st.cache_data(ttl=5, show_spinner=False)
 def load_health(path: str) -> dict:
     """Baca bot_health.json dari folder bot."""
     fpath = os.path.join(path, "bot_health.json")
@@ -408,5 +408,5 @@ with tab_single:
 # =============================================================================
 # AUTO-REFRESH MASTER (Trigger global)
 # =============================================================================
-time.sleep(1.5)
+time.sleep(5)
 st.rerun()
