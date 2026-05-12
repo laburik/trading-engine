@@ -35,8 +35,15 @@ st.markdown("""
 # =============================================================================
 # DYNAMIC PATH LOADERS
 # =============================================================================
-@st.cache_data(ttl=5)
-def load_trade_history(path: str) -> pd.DataFrame:
+def _file_signature(folder: str, filename: str) -> float:
+    """Ambil waktu modifikasi file. Dipakai sebagai 'sidik jari' cache."""
+    try:
+        return os.path.getmtime(os.path.join(folder, filename))
+    except OSError:
+        return 0.0
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_trade_history(path: str, _mtime: float) -> pd.DataFrame:
     file = os.path.join(path, "trade_history.csv")
     if not os.path.exists(file):
         return pd.DataFrame()
@@ -44,23 +51,42 @@ def load_trade_history(path: str) -> pd.DataFrame:
         df = pd.read_csv(file)
         if "timestamp" in df.columns:
             df["time"] = pd.to_datetime(df["timestamp"], unit="s")
+        # Optimasi: Lakukan konversi PnL ke numerik sekali di sini agar ter-cache
+        if "pnl" in df.columns:
+            df["pnl"] = pd.to_numeric(df["pnl"], errors="coerce")
         return df
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=5)
-def load_equity_curve(path: str) -> pd.DataFrame:
+@st.cache_data(ttl=60, show_spinner=False)
+def load_equity_curve(path: str, _mtime: float) -> pd.DataFrame:
     file = os.path.join(path, "equity_curve.csv")
     if not os.path.exists(file):
         return pd.DataFrame()
     try:
-        df = pd.read_csv(file)
-        if "timestamp" in df.columns:
-            df["time"] = pd.to_datetime(df["timestamp"], unit="s")
+        df = pd.read_csv(
+            file,
+            usecols=["timestamp", "equity", "balance", "unrealized_pnl"],
+            dtype={"equity": "float32", "balance": "float32", "unrealized_pnl": "float32"},
+        )
+        df["time"] = pd.to_datetime(df["timestamp"], unit="s")
         return df.tail(5000)
     except Exception:
         return pd.DataFrame()
 
+@st.cache_data(ttl=60, show_spinner=False)
+def resample_equity(path: str, _mtime: float) -> pd.DataFrame:
+    """Resample equity ke 1 menit, di-cache per bot."""
+    df = load_equity_curve(path, _mtime)
+    if df.empty or "time" not in df.columns:
+        return pd.DataFrame()
+    return (
+        df.set_index("time")[["equity", "balance"]]
+          .resample("1min").last().ffill()
+    )
+
+
+@st.cache_data(ttl=5)
 def read_heartbeat(path: str) -> dict:
     file = os.path.join(path, "heartbeat.json")
     try:
@@ -88,11 +114,11 @@ def load_health(path: str) -> dict:
     return {}
 
 def calc_winrate(df: pd.DataFrame) -> float:
-    closed = df[df["pnl"].notna() & (df["pnl"] != "")]
+    if df.empty or "pnl" not in df.columns:
+        return 0.0
+    closed = df[df["pnl"].notna()]
     if closed.empty:
         return 0.0
-    closed = closed.copy()
-    closed["pnl"] = pd.to_numeric(closed["pnl"], errors="coerce")
     winners = (closed["pnl"] > 0).sum()
     return round(winners / len(closed) * 100, 2)
 
@@ -106,7 +132,7 @@ default_paths = ".\n"
 raw_paths = st.sidebar.text_area("Daftar Folder Bot:", value=default_paths, height=120)
 
 valid_bots = {}
-for p in raw_paths.strip().split("\n"):
+for p in raw_paths.splitlines():    
     p = p.strip()
     if not p: continue
     
@@ -156,11 +182,12 @@ with tab_portfolio:
     total_pnl_now = 0.0
 
     for b_name, b_path in valid_bots.items():
-        df = load_equity_curve(b_path)
-        if not df.empty and "time" in df.columns:
+        eq_mtime = _file_signature(b_path, "equity_curve.csv")
+        tr_mtime = _file_signature(b_path, "trade_history.csv")
+        df_resampled = resample_equity(b_path, eq_mtime)
+        if not df_resampled.empty:
             try:
-                # Group by minute to align mis-matched timestamps from various bots
-                df_resampled = df.set_index("time")[["equity", "balance"]].resample("1min").last().ffill()
+                df_resampled = df_resampled.copy()
                 df_resampled.columns = [f"{b_name}_equity", f"{b_name}_balance"]
                 all_equity.append(df_resampled)
                 
@@ -168,10 +195,9 @@ with tab_portfolio:
                 total_equity_now += df_resampled[f"{b_name}_equity"].iloc[-1]
                 
                 # Fetch Realized PnL
-                trades = load_trade_history(b_path)
-                if not trades.empty:
-                    cl = trades[trades["pnl"].notna() & (trades["pnl"] != "")].copy()
-                    cl["pnl"] = pd.to_numeric(cl["pnl"], errors="coerce").fillna(0)
+                trades = load_trade_history(b_path, tr_mtime)
+                if not trades.empty and "pnl" in trades.columns:
+                    cl = trades[trades["pnl"].notna()]
                     total_pnl_now += cl["pnl"].sum()
             except Exception as e:
                 pass
@@ -204,8 +230,10 @@ with tab_single:
 
     heartbeat = read_heartbeat(active_path)
     online    = bot_is_online(heartbeat)
-    trade_df  = load_trade_history(active_path)
-    equity_df = load_equity_curve(active_path)
+    tr_mtime  = _file_signature(active_path, "trade_history.csv")
+    eq_mtime  = _file_signature(active_path, "equity_curve.csv")
+    trade_df  = load_trade_history(active_path, tr_mtime)
+    equity_df = load_equity_curve(active_path, eq_mtime)
 
     col_status, col_pnl, col_equity, col_winrate, col_trades = st.columns([1.5, 1.5, 1.5, 1, 1])
 
@@ -227,14 +255,14 @@ with tab_single:
     current_balance  = equity_df["balance"].iloc[-1] if not equity_df.empty else 0.0
     unrealized       = equity_df["unrealized_pnl"].iloc[-1] if not equity_df.empty else 0.0
 
-    closed_trades = trade_df[trade_df["pnl"].notna() & (trade_df["pnl"] != "")].copy() if not trade_df.empty else pd.DataFrame()
-    total_pnl = 0.0
-    if not closed_trades.empty:
-        closed_trades["pnl"] = pd.to_numeric(closed_trades["pnl"], errors="coerce").fillna(0)
-        total_pnl = round(closed_trades["pnl"].sum(), 4)
+    if not trade_df.empty and "pnl" in trade_df.columns:
+        closed_trades = trade_df.dropna(subset=["pnl"])
+    else:
+        closed_trades = pd.DataFrame()
 
-    winrate      = calc_winrate(trade_df) if not trade_df.empty else 0.0
-    total_trades = len(closed_trades) if not closed_trades.empty else 0
+    total_trades = len(closed_trades)
+    total_pnl    = round(closed_trades["pnl"].sum(), 4) if total_trades else 0.0
+    winrate      = round((closed_trades["pnl"] > 0).mean() * 100, 2) if total_trades else 0.0
 
     with col_pnl:
         color = "pnl-positive" if total_pnl >= 0 else "pnl-negative"
@@ -398,7 +426,7 @@ with tab_single:
         if "time" in display_df.columns:
             display_df = display_df.drop(columns=["timestamp"], errors="ignore")
         st.dataframe(
-            display_df.sort_values("time", ascending=False).head(100),
+            display_df.nlargest(100, "time"),
             width="stretch",
             hide_index=True,
         )
@@ -408,5 +436,13 @@ with tab_single:
 # =============================================================================
 # AUTO-REFRESH MASTER (Trigger global)
 # =============================================================================
-time.sleep(5)
-st.rerun()
+st.sidebar.divider()
+st.sidebar.markdown("### ⚙️ Pengaturan Auto-Refresh")
+auto_refresh = st.sidebar.checkbox("Aktifkan Auto-Refresh", value=True, help="Matikan saat Anda ingin berinteraksi/klik tanpa gangguan.")
+refresh_interval = st.sidebar.slider("Interval (detik)", min_value=5, max_value=60, value=15)
+
+# Install dulu: pip install streamlit-autorefresh
+from streamlit_autorefresh import st_autorefresh
+
+if auto_refresh:
+    st_autorefresh(interval=refresh_interval * 1000, key="master_autorefresh")

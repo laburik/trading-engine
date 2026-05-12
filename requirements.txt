@@ -8,6 +8,8 @@ aiohttp>=3.9.0         # WebSocket client + async HTTP
 streamlit>=1.32.0      # Monitoring dashboard
 pandas>=2.0.0          # CSV loading + data manipulation
 sortedcontainers>=2.4.0 # Optimized dictionary operations
+streamlit-autorefresh==1.0.1  # Automatic dashboard refresh
+
 
 # === Standard library (no install needed) ===
 # asyncio, json, csv, os, time, hmac, hashlib, uuid, threading, queue, collections, logging

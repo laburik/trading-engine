@@ -169,8 +169,8 @@ def _process_orderbook_message(msg: dict[str, object]) -> None:
     # Push to buffer
     snapshot_copy: OrderbookSnapshot = {
         "timestamp": time.time(),
-        "bids": sorted(orderbook_snapshot["bids"].items(), reverse=True)[:ORDERBOOK_DEPTH],
-        "asks": sorted(orderbook_snapshot["asks"].items())[:ORDERBOOK_DEPTH],
+        "bids": list(reversed(orderbook_snapshot["bids"].items()))[:ORDERBOOK_DEPTH],
+        "asks": list(orderbook_snapshot["asks"].items())[:ORDERBOOK_DEPTH],
         "best_bid": dict(best_bid),  # type: ignore[typeddict-item]
         "best_ask": dict(best_ask),  # type: ignore[typeddict-item]
     }

@@ -20,6 +20,7 @@ import json
 import os
 import time
 import threading
+from collections import deque
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KONFIGURASI
@@ -44,6 +45,21 @@ EXECUTION_GRACE_TICKS     = 2     # tunggu N tick sebelum dianggap gagal eksekus
 # ── Deteksi #4: Buffer Overflow ─────────────────────────────────────────────
 BUFFER_OVERFLOW_FACTOR    = 1.5   # count > LIMIT * faktor ini = overflow
 BUFFER_HARD_LIMIT         = 1500  # hard limit jika LIMIT tidak tersedia
+
+# Hitung sekali dari config — tidak perlu rebuild setiap tick
+try:
+    from config import TIMEFRAMES as _TIMEFRAMES_CFG
+    _TF_SECONDS: dict[str, int] = {tf: v[0] for tf, v in _TIMEFRAMES_CFG.items()}
+    _TF_LIMITS:  dict[str, int] = {tf: v[1] for tf, v in _TIMEFRAMES_CFG.items()}
+except Exception:
+    _TF_SECONDS = {
+        "1m": 60,   "3m": 180,  "5m": 300,
+        "15m": 900, "30m": 1800,
+        "1h": 3600, "2h": 7200, "4h": 14400,
+        "6h": 21600, "8h": 28800, "12h": 43200,
+        "1d": 86400,
+    }
+    _TF_LIMITS = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATE IN-MEMORY (direset setiap bot restart)
@@ -72,7 +88,7 @@ _state = {
 
     # ML tracking
     "last_ml_prob":         None,
-    "ml_prob_history":      [],   # rolling 20 nilai terakhir
+    "ml_prob_history":      deque(maxlen=20),   # rolling 20 nilai terakhir
 
     # Status
     "status":               "STARTING",
@@ -96,7 +112,7 @@ _state = {
     "ml_drift_std":         None,
 
     # ── Deteksi #2: Balance Anomaly ──────────────────────────────────────
-    "equity_history":       [],   # list of (timestamp, equity)
+    "equity_history":       deque(maxlen=BALANCE_HISTORY_MAX),   # list of (timestamp, equity)
     "equity_peak":          0.0,
     "equity_anomaly":       "",   # string deskripsi anomali jika ada
 
@@ -156,10 +172,7 @@ def record_tick(signal: dict, ml_prob: float = None, data: dict = None,
         # ML probability
         if ml_prob is not None:
             _state["last_ml_prob"] = round(ml_prob, 4)
-            hist = _state["ml_prob_history"]
-            hist.append(round(ml_prob, 4))
-            if len(hist) > 20:
-                hist.pop(0)
+            _state["ml_prob_history"].append(round(ml_prob, 4))
 
         # Data quality
         if data is not None:
@@ -226,23 +239,7 @@ def _analyze_data_quality(data: dict, now: float):
                 age_sec = round(now - last_open_time)
                 new_ages[tf] = age_sec
 
-                # NEW-05 FIX: Bangun TF_SECONDS secara dinamis dari config.TIMEFRAMES
-                # agar semua TF apapun ("2h", "3h", dll) otomatis terdaftar.
-                # Sebelumnya hardcode hanya sampai "4h" sehingga "2h" fallback ke
-                # 900 (15m) dan candle 2h SELALU dianggap STALE di dashboard.
-                try:
-                    from config import TIMEFRAMES as _tf_cfg
-                    TF_SECONDS = {tf: v[0] for tf, v in _tf_cfg.items()}
-                except Exception:
-                    # Fallback jika config tidak bisa diimport
-                    TF_SECONDS = {
-                        "1m":  60,  "3m":  180, "5m":   300,
-                        "15m": 900, "30m": 1800,
-                        "1h":  3600, "2h": 7200, "4h":  14400,
-                        "6h":  21600, "8h": 28800, "12h": 43200,
-                        "1d":  86400,
-                    }
-                expected_interval = TF_SECONDS.get(tf, 900)
+                expected_interval = _TF_SECONDS.get(tf, 900)
                 # Candle dianggap stale jika usianya > 3x interval
                 if age_sec > expected_interval * 3:
                     mins = age_sec // 60
@@ -281,13 +278,8 @@ def _analyze_data_quality(data: dict, now: float):
 
     # ── 4. Deteksi Buffer Overflow (Ide #4) ─────────────────────────────
     overflow = {}
-    try:
-        from config import TIMEFRAMES
-        limits = {tf: v[1] for tf, v in TIMEFRAMES.items()}
-    except Exception:
-        limits = {}
     for tf, count in new_counts.items():
-        limit = limits.get(tf, BUFFER_HARD_LIMIT)
+        limit = _TF_LIMITS.get(tf, BUFFER_HARD_LIMIT)
         threshold = int(limit * BUFFER_OVERFLOW_FACTOR)
         overflow[tf] = count > threshold
         if overflow[tf]:
@@ -327,10 +319,7 @@ def _check_model_drift():
 # ─────────────────────────────────────────────────────────────────────────────
 def _check_balance_anomaly(equity: float, now: float):
     """Cek apakah ada penurunan equity yang tidak wajar."""
-    hist = _state["equity_history"]
-    hist.append((now, equity))
-    if len(hist) > BALANCE_HISTORY_MAX:
-        hist.pop(0)
+    _state["equity_history"].append((now, equity))
 
     # Update equity peak
     if equity > _state["equity_peak"]:
