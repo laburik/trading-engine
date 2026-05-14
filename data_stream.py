@@ -1,13 +1,12 @@
 # =============================================================================
-# data_stream.py — Real-Time Data Ingestion Layer (Bybit WebSocket + REST)
+# data_stream.py — Real-Time Data Ingestion Layer (CCXT Pro WebSocket)
 # =============================================================================
-#██████╗ ██╗███████╗██╗  ██╗██╗   ██╗    ██╗  ██╗███████╗███╗   ██╗ ██████╗ ██╗  ██╗███████╗██████╗ ██████╗ ██████╗  ██████╗ 
+#██████╗ ██╗███████╗██╗  ██╗██╗   ██╗    ██╗  ██╗███████╗███╗   ██╗ ██████╗ ██╗  ██╗███████╗██████╗ ██████╗ ██████╗  ██████╗
 #██╔══██╗██║╚══███╔╝██║ ██╔╝╚██╗ ██╔╝    ██║  ██║██╔════╝████╗  ██║██╔════╝ ██║ ██╔╝██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔═══██╗
 #██████╔╝██║  ███╔╝ █████╔╝  ╚████╔╝     ███████║█████╗  ██╔██╗ ██║██║  ███╗█████╔╝ █████╗  ██████╔╝██████╔╝██████╔╝██║   ██║
 #██╔══██╗██║ ███╔╝  ██╔═██╗   ╚██╔╝      ██╔══██║██╔══╝  ██║╚██╗██║██║   ██║██╔═██╗ ██╔══╝  ██╔══██╗██╔═══╝ ██╔══██╗██║   ██║
 #██║  ██║██║███████╗██║  ██╗   ██║       ██║  ██║███████╗██║ ╚████║╚██████╔╝██║  ██╗███████╗██║  ██║██║     ██║  ██║╚██████╔╝
-#╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝       ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝ ╚═════╝ 
-                                                                                                                            
+#╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝       ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝ ╚═════╝
 # if you copy, haram, unless you ask permission from the author
 # for personal use only, if you use it for commercial purposes, you will be responsible for your own actions
 from __future__ import annotations
@@ -17,12 +16,10 @@ import json
 import time
 import logging
 from typing import Optional
-import aiohttp
 from collections import deque
 from sortedcontainers import SortedDict
 from config import (
-    SYMBOL, CATEGORY, WS_PUBLIC_URL, REST_URL,
-    TICK_BUFFER_SIZE, ORDERBOOK_BUFFER_SIZE,
+    SYMBOL, TICK_BUFFER_SIZE, ORDERBOOK_BUFFER_SIZE,
     ORDERBOOK_DEPTH, FUNDING_RATE_INTERVAL_SEC,
     HEARTBEAT_FILE, HEARTBEAT_INTERVAL_SEC,
     DATA_MODE,
@@ -34,6 +31,8 @@ from ft_types import (
     OrderbookSnapshot,
     TickData,
 )
+from ccxt_client import exchange
+import ccxt_client
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -84,52 +83,29 @@ async def _heartbeat_loop() -> None:
 
 
 # =============================================================================
-# FUNDING RATE (REST polling)
+# FUNDING RATE (via CCXT Pro REST)
 # =============================================================================
-async def _fetch_funding_rate(session: aiohttp.ClientSession) -> None:
-    """Fetch current funding rate from Bybit REST API."""
-    url = f"{REST_URL}/v5/market/funding/history"
-    params: dict[str, str | int] = {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "limit": 1,
-    }
+async def _fetch_funding_rate() -> None:
+    """Fetch current funding rate dari Bybit via CCXT."""
     try:
-        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            data: dict[str, object] = await resp.json()
-            if data.get("retCode") == 0:
-                result_list = data["result"]  # type: ignore[index]
-                entries: list[dict[str, str]] = result_list["list"]  # type: ignore[index]
-                if entries:
-                    fr: float = float(entries[0].get("fundingRate", 0.0))
-                    funding_rate["value"] = fr
-                    logger.info(f"Funding rate updated: {fr:.6f}")
+        fr_data = await exchange.fetch_funding_rate(ccxt_client.CCXT_SYMBOL)
+        fr: float = float(fr_data.get("fundingRate") or 0.0)
+        funding_rate["value"] = fr
+        logger.info(f"Funding rate updated: {fr:.6f}")
     except Exception as e:
         logger.warning(f"Funding rate fetch error: {e}")
 
 
-async def _funding_rate_loop(session: aiohttp.ClientSession) -> None:
+async def _funding_rate_loop() -> None:
     """Poll funding rate every FUNDING_RATE_INTERVAL_SEC."""
     while True:
-        await _fetch_funding_rate(session)
+        await _fetch_funding_rate()
         await asyncio.sleep(FUNDING_RATE_INTERVAL_SEC)
 
 
 # =============================================================================
-# ORDERBOOK PROCESSING
+# ORDERBOOK PROCESSING (CCXT Pro — snapshot + delta merge ditangani internal)
 # =============================================================================
-def _apply_orderbook_delta(side: str, updates: list[list[str]]) -> None:
-    """Apply incremental orderbook updates (Bybit delta format)."""
-    book: SortedDict = orderbook_snapshot[side]
-    for price_str, qty_str in updates:
-        price: float = float(price_str)
-        qty: float = float(qty_str)
-        if qty == 0:
-            book.pop(price, None)
-        else:
-            book[price] = qty
-
-
 def _update_best_bid_ask() -> None:
     """Recalculate best bid and best ask from snapshot."""
     bids: SortedDict = orderbook_snapshot["bids"]
@@ -146,27 +122,28 @@ def _update_best_bid_ask() -> None:
         best_ask["qty"] = qty
 
 
-def _process_orderbook_message(msg: dict[str, object]) -> None:
-    """Handle orderbook snapshot and delta messages."""
-    msg_type: str = str(msg.get("type", ""))
-    data: dict[str, list[list[str]]] = msg.get("data", {})  # type: ignore[assignment]
+def _process_ccxt_orderbook(ob: dict) -> None:
+    """
+    Update orderbook_snapshot, best_bid, best_ask dari CCXT Pro orderbook object.
+    CCXT Pro sudah menggabungkan snapshot + delta secara internal — tidak perlu
+    manual delta apply lagi.
+    ob["bids"] = [[price, qty], ...] sorted descending
+    ob["asks"] = [[price, qty], ...] sorted ascending
+    """
+    orderbook_snapshot["bids"].clear()
+    orderbook_snapshot["asks"].clear()
 
-    if msg_type == "snapshot":
-        orderbook_snapshot["bids"].clear()
-        orderbook_snapshot["bids"].update(
-            {float(p): float(q) for p, q in data.get("b", [])}
-        )
-        orderbook_snapshot["asks"].clear()
-        orderbook_snapshot["asks"].update(
-            {float(p): float(q) for p, q in data.get("a", [])}
-        )
-    elif msg_type == "delta":
-        _apply_orderbook_delta("bids", data.get("b", []))
-        _apply_orderbook_delta("asks", data.get("a", []))
+    for price, qty in (ob.get("bids") or [])[:ORDERBOOK_DEPTH]:
+        if float(qty) > 0:
+            orderbook_snapshot["bids"][float(price)] = float(qty)
+
+    for price, qty in (ob.get("asks") or [])[:ORDERBOOK_DEPTH]:
+        if float(qty) > 0:
+            orderbook_snapshot["asks"][float(price)] = float(qty)
 
     _update_best_bid_ask()
 
-    # Push to buffer
+    # Push ke buffer (format identik dengan versi lama)
     snapshot_copy: OrderbookSnapshot = {
         "timestamp": time.time(),
         "bids": list(reversed(orderbook_snapshot["bids"].items()))[:ORDERBOOK_DEPTH],
@@ -178,19 +155,21 @@ def _process_orderbook_message(msg: dict[str, object]) -> None:
 
 
 # =============================================================================
-# TICK PROCESSING
+# TICK PROCESSING (CCXT Pro)
 # =============================================================================
-def _process_trade_message(msg: dict[str, object]) -> None:
-    """Handle publicTrade messages (tick-by-tick)."""
-    data_list: list[dict[str, object]] = msg.get("data", [])  # type: ignore[assignment]
+def _process_ccxt_trades(trades: list) -> None:
+    """
+    Convert CCXT trade list ke TickData dan push ke tick_buffer.
+    CCXT side: "buy"/"sell" → dipetakan ke "Buy"/"Sell" sesuai format internal.
+    """
     has_new: bool = False
-    for trade in data_list:
+    for trade in trades:
         tick: TickData = {
-            "timestamp": float(trade.get("T", time.time() * 1000)) / 1000,  # type: ignore[arg-type]
-            "price": float(trade.get("p", 0)),  # type: ignore[arg-type]
-            "qty": float(trade.get("v", 0)),  # type: ignore[arg-type]
-            "side": str(trade.get("S", "")),    # "Buy" or "Sell"
-            "trade_id": str(trade.get("i", "")),
+            "timestamp": float(trade.get("timestamp") or time.time() * 1000) / 1000,
+            "price":     float(trade.get("price", 0)),
+            "qty":       float(trade.get("amount", 0)),
+            "side":      "Buy" if trade.get("side") == "buy" else "Sell",
+            "trade_id":  str(trade.get("id", "")),
         }
         tick_buffer.append(tick)
         has_new = True
@@ -200,92 +179,43 @@ def _process_trade_message(msg: dict[str, object]) -> None:
 
 
 # =============================================================================
-# WEBSOCKET HANDLER
+# CCXT PRO WATCH LOOPS
+# Auto-reconnect ditangani CCXT Pro secara internal — tidak perlu manual retry.
 # =============================================================================
-async def _ws_handler(ws: aiohttp.ClientWebSocketResponse) -> None:
-    """Main WebSocket message dispatcher."""
-    async for msg in ws:
-        if msg.type == aiohttp.WSMsgType.TEXT:
-            try:
-                data: dict[str, object] = json.loads(msg.data)
-
-                # --- TANGKAP ERROR DARI BYBIT ---
-                if "success" in data and data["success"] is False:
-                    # Cetak alasan penolakan dari Bybit ke terminal
-                    logger.error(f"🚨 BYBIT ERROR: {data.get('ret_msg', 'Permintaan ditolak server/topic tidak valid')}")
-                # --------------------------------
-
-                topic: str = str(data.get("topic", ""))
-
-                if topic.startswith("publicTrade"):
-                    _process_trade_message(data)
-
-                elif topic.startswith("orderbook"):
-                    _process_orderbook_message(data)
-
-            except json.JSONDecodeError:
-                pass
-            except Exception as e:
-                logger.error(f"WS handler error: {e}")
-
-        elif msg.type == aiohttp.WSMsgType.ERROR:
-            logger.error(f"WebSocket error: {ws.exception()}")
-            break
-        elif msg.type == aiohttp.WSMsgType.CLOSED:
-            logger.warning("WebSocket connection closed.")
-            break
-
-
-# =============================================================================
-# WEBSOCKET CONNECTION WITH AUTO-RECONNECT
-# =============================================================================
-async def _connect_websocket(session: aiohttp.ClientSession) -> None:
-    """Connect to Bybit public WebSocket with auto-reconnect."""
-    reconnect_delay: int = 1
-    max_delay: int = 60
-
+async def _watch_orderbook_loop() -> None:
+    """
+    Watch orderbook via CCXT Pro.
+    Menggantikan: manual WS connect + subscribe + snapshot/delta handler + auto-reconnect.
+    """
+    logger.info(f"Starting orderbook watch for {ccxt_client.CCXT_SYMBOL} (depth={ORDERBOOK_DEPTH})...")
     while True:
         try:
-            logger.info(f"Connecting to WebSocket: {WS_PUBLIC_URL}")
-            async with session.ws_connect(
-                WS_PUBLIC_URL,
-                heartbeat=20,
-                receive_timeout=30,
-            ) as ws:
-                reconnect_delay = 1  # Reset on successful connect
-
-                # Subscribe berdasarkan DATA_MODE
-                if DATA_MODE == "tick":
-                    # Mode tick: butuh trade stream + orderbook
-                    subscribe_msg: dict[str, object] = {
-                        "op": "subscribe",
-                        "args": [
-                            f"publicTrade.{SYMBOL}",
-                            f"orderbook.{ORDERBOOK_DEPTH}.{SYMBOL}",
-                        ]
-                    }
-                    await ws.send_str(json.dumps(subscribe_msg))
-                    logger.info(f"Subscribed to: publicTrade.{SYMBOL}, orderbook.{ORDERBOOK_DEPTH}.{SYMBOL}")
-                else:
-                    # Mode kline: hanya butuh orderbook (kline diurus candle_stream.py)
-                    subscribe_msg = {
-                        "op": "subscribe",
-                        "args": [f"orderbook.{ORDERBOOK_DEPTH}.{SYMBOL}"]
-                    }
-                    await ws.send_str(json.dumps(subscribe_msg))
-                    logger.info(f"[data_stream] Subscribed to: orderbook.{ORDERBOOK_DEPTH}.{SYMBOL} (kline mode, trade stream handled by candle_stream)")
-
-                await _ws_handler(ws)
-
+            ob = await exchange.watch_order_book(ccxt_client.CCXT_SYMBOL, limit=ORDERBOOK_DEPTH)
+            _process_ccxt_orderbook(ob)
         except asyncio.CancelledError:
-            logger.info("WebSocket task cancelled.")
+            logger.info("Orderbook watch cancelled.")
             break
         except Exception as e:
-            logger.error(f"WebSocket connection error: {e}")
+            logger.error(f"Orderbook watch error: {e}. Retrying in 1s...")
+            await asyncio.sleep(1)
 
-        logger.info(f"Reconnecting in {reconnect_delay}s...")
-        await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, max_delay)
+
+async def _watch_trades_loop() -> None:
+    """
+    Watch tick-by-tick trades via CCXT Pro.
+    Hanya aktif di DATA_MODE = 'tick'.
+    """
+    logger.info(f"Starting trades watch for {ccxt_client.CCXT_SYMBOL}...")
+    while True:
+        try:
+            trades = await exchange.watch_trades(ccxt_client.CCXT_SYMBOL)
+            _process_ccxt_trades(trades)
+        except asyncio.CancelledError:
+            logger.info("Trades watch cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"Trades watch error: {e}. Retrying in 1s...")
+            await asyncio.sleep(1)
 
 
 # =============================================================================
@@ -293,27 +223,33 @@ async def _connect_websocket(session: aiohttp.ClientSession) -> None:
 # =============================================================================
 async def start_data_stream() -> None:
     """
-    Start all data stream components:
-    - WebSocket (tick + orderbook)
-    - Funding rate REST loop
+    Start all data stream components via CCXT Pro:
+    - Orderbook watch (always active)
+    - Trades watch  (only in DATA_MODE = 'tick')
+    - Funding rate poll loop
     - Heartbeat writer
     """
     global new_tick_event
     new_tick_event = asyncio.Event()
 
-    logger.info(f"Starting data stream for {SYMBOL}...")
+    logger.info(f"Starting data stream for {SYMBOL} (DATA_MODE={DATA_MODE})...")
 
-    connector = aiohttp.TCPConnector(limit=20, ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        # Fetch initial funding rate
-        await _fetch_funding_rate(session)
+    # Fetch initial funding rate
+    await _fetch_funding_rate()
 
-        # Run all loops concurrently
-        await asyncio.gather(
-            _connect_websocket(session),
-            _funding_rate_loop(session),
-            _heartbeat_loop(),
-        )
+    loops = [
+        _watch_orderbook_loop(),
+        _funding_rate_loop(),
+        _heartbeat_loop(),
+    ]
+
+    if DATA_MODE == "tick":
+        loops.append(_watch_trades_loop())
+        logger.info(f"Tick mode: trades watch enabled for {SYMBOL}")
+    else:
+        logger.info("Kline mode: trades handled by candle_stream — trades watch skipped")
+
+    await asyncio.gather(*loops)
 
 
 if __name__ == "__main__":

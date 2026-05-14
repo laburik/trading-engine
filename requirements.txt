@@ -1,8 +1,14 @@
 # Trading Bot Requirements
 # Python 3.10+
 
-# === Core Async ===
-aiohttp>=3.9.0         # WebSocket client + async HTTP
+# === Exchange API ===
+ccxt>=4.4.0            # Unified exchange API (REST + WebSocket via ccxt.pro)
+                       # Otomatis menginstall aiohttp sebagai dependency-nya.
+#
+# !! PENTING SETELAH INSTALL !!
+# ccxt juga menginstall aiodns yang membreak DNS resolution di environment ini.
+# Jalankan perintah ini setelah pip install -r requirements.txt:
+#   pip uninstall aiodns -y
 
 # === Dashboard ===
 streamlit>=1.32.0      # Monitoring dashboard
@@ -12,4 +18,5 @@ streamlit-autorefresh==1.0.1  # Automatic dashboard refresh
 
 
 # === Standard library (no install needed) ===
-# asyncio, json, csv, os, time, hmac, hashlib, uuid, threading, queue, collections, logging
+# asyncio, json, csv, os, time, threading, queue, collections, logging, ssl
+# (hmac, hashlib, uuid sudah tidak dipakai — digantikan CCXT)

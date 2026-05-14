@@ -25,8 +25,8 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from typing import TYPE_CHECKING, Optional
-import aiohttp
-from config import SYMBOL, MODE, REST_MARKET_URL, TIMEFRAMES, DATA_MODE
+from config import SYMBOL, MODE, TIMEFRAMES, DATA_MODE
+from ccxt_client import init_exchange, close_exchange
 from ft_types import MarketDataSnapshot
 
 # --- Selalu import ---
@@ -49,87 +49,51 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-# =============================================================================
-# BYBIT INTERVAL LABEL MAP
-# =============================================================================
-_BYBIT_INTERVAL_MAP: dict[int, str] = {
-    60:    "1",
-    180:   "3",
-    300:   "5",
-    900:   "15",
-    1800:  "30",
-    3600:  "60",
-    7200:  "120",
-    14400: "240",
-    21600: "360",
-    43200: "720",
-    86400: "D",
-}
+# (Interval map dihapus — CCXT menerima label timeframe langsung, mis. "15m", "2h")
 
 
 # =============================================================================
-# PRELOAD: Fetch historical klines from Bybit REST
+# PRELOAD: Fetch historical klines via CCXT
 # =============================================================================
 async def preload_all_timeframes() -> None:
     """
-    Unduh histori candle dari Bybit REST, masukkan ke buffer modul aktif
+    Unduh histori candle via CCXT fetch_ohlcv, masukkan ke buffer modul aktif
     (candle_stream atau data_resampler, tergantung DATA_MODE).
     Selesai → set is_warmup = False di modul aktif.
     """
+    from ccxt_client import exchange, CCXT_SYMBOL
     logger.info(f"Preloading historical candles (DATA_MODE={DATA_MODE})...")
 
-    base_url: str  = REST_MARKET_URL  # OLD-08 FIX: pakai REST_MARKET_URL (selalu live) bukan REST_BASE_URL
-    endpoint: str  = f"{base_url}/v5/market/kline"
-    timeout        = aiohttp.ClientTimeout(total=15)
-    connector      = aiohttp.TCPConnector(ssl=False)
+    for tf, (interval_sec, max_candles) in TIMEFRAMES.items():
+        if interval_sec < 60:
+            logger.info(f"[PRELOAD] [{tf}] Skipped (sub-minute tidak tersedia via kline API)")
+            continue
 
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        for tf, (interval_sec, max_candles) in TIMEFRAMES.items():
-            if interval_sec < 60:
-                logger.info(f"[PRELOAD] [{tf}] Skipped (sub-minute not available via Bybit kline API)")
+        try:
+            # CCXT menerima label TF langsung ("1m", "15m", "2h") — tidak perlu mapping manual
+            limit: int = min(max_candles + 1, 200)  # +1 cadangan untuk strip open candle
+            ohlcv: list[list] = await exchange.fetch_ohlcv(CCXT_SYMBOL, timeframe=tf, limit=limit)
+
+            if not ohlcv:
+                logger.warning(f"[PRELOAD] [{tf}] Empty response — skipped")
                 continue
 
-            bybit_interval: Optional[str] = _BYBIT_INTERVAL_MAP.get(interval_sec)
-            if bybit_interval is None:
-                logger.warning(f"[PRELOAD] [{tf}] No Bybit interval mapping for {interval_sec}s — skipped")
-                continue
+            # Strip candle yang masih terbuka (candle terbaru belum ditutup)
+            # CCXT mengembalikan data oldest-first, jadi candle terbuka ada di indeks [-1]
+            newest_ts_ms: int = int(ohlcv[-1][0])
+            if newest_ts_ms + interval_sec * 1000 > int(_time.time() * 1000):
+                ohlcv = ohlcv[:-1]
+                logger.info(f"[PRELOAD] [{tf}] Stripped currently open candle (not yet closed)")
 
-            params: dict[str, str | int] = {
-                "category": "linear",
-                "symbol":   SYMBOL,
-                "interval": bybit_interval,
-                "limit":    min(max_candles, 200),
-            }
+            # CCXT format: [[ts_ms, open, high, low, close, volume], ...]
+            # Kompatibel langsung dengan preload_candles() di kedua modul
+            loaded: int = active_data.preload_candles(tf, ohlcv)
+            logger.info(f"[PRELOAD] [{tf}] {loaded} closed candles loaded (timeframe={tf})")
 
-            try:
-                async with session.get(endpoint, params=params) as resp:
-                    if resp.status != 200:
-                        logger.error(f"[PRELOAD] [{tf}] HTTP {resp.status} — skipped")
-                        continue
-                    body: dict[str, object] = await resp.json()
-
-                if body.get("retCode") != 0:
-                    logger.error(f"[PRELOAD] [{tf}] API error: {body.get('retMsg')} — skipped")
-                    continue
-
-                result_data: dict[str, object] = body.get("result", {})  # type: ignore[assignment]
-                raw_klines: list[list[str]] = result_data.get("list", [])  # type: ignore[assignment]
-                if not raw_klines:
-                    logger.warning(f"[PRELOAD] [{tf}] Empty kline response — skipped")
-                    continue
-
-                newest_start_ms: int = int(raw_klines[0][0])
-                if newest_start_ms + interval_sec * 1000 > int(_time.time() * 1000):
-                    raw_klines = raw_klines[1:]
-                    logger.info(f"[PRELOAD] [{tf}] Stripped currently open candle (not yet closed)")
-
-                loaded: int = active_data.preload_candles(tf, raw_klines)
-                logger.info(f"[PRELOAD] [{tf}] {loaded} closed candles loaded (interval={bybit_interval})")
-
-            except asyncio.TimeoutError:
-                logger.error(f"[PRELOAD] [{tf}] Request timed out — skipped")
-            except Exception as e:
-                logger.error(f"[PRELOAD] [{tf}] Unexpected error: {e} — skipped")
+        except asyncio.TimeoutError:
+            logger.error(f"[PRELOAD] [{tf}] Request timed out — skipped")
+        except Exception as e:
+            logger.error(f"[PRELOAD] [{tf}] Unexpected error: {e} — skipped")
 
     # Lepas flag warmup di modul aktif
     active_data.is_warmup = False
@@ -231,6 +195,11 @@ async def main() -> None:
         logger.info(f"  PnL       : Sync dari Bybit setiap {__import__('config').PNL_SYNC_INTERVAL}s")
     logger.info("=" * 60)
 
+    # ── CCXT INIT ──────────────────────────────────────────────────────────────
+    # Muat market info dari Bybit (diperlukan oleh execution, position_manager, preload)
+    await init_exchange()
+    # ───────────────────────────────────────────────────────────────────────────
+
     # ── PRE-FLIGHT CHECK ────────────────────────────────────────────────────
     # Validasi sintaks, file, library, config, dan strategy sebelum bot jalan.
     # Jika ada error apapun, bot langsung berhenti + tampilkan daftar masalah.
@@ -293,6 +262,7 @@ async def main() -> None:
 
         from trade_logger import shutdown as logger_shutdown
         logger_shutdown()
+        await close_exchange()
         logger.info("Bot stopped.")
 
 

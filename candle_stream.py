@@ -1,42 +1,40 @@
-#██████╗ ██╗███████╗██╗  ██╗██╗   ██╗    ██╗  ██╗███████╗███╗   ██╗ ██████╗ ██╗  ██╗███████╗██████╗ ██████╗ ██████╗  ██████╗ 
+# =============================================================================
+# candle_stream.py — Bybit Kline Stream via CCXT Pro (DATA_MODE = "kline")
+# =============================================================================
+#██████╗ ██╗███████╗██╗  ██╗██╗   ██╗    ██╗  ██╗███████╗███╗   ██╗ ██████╗ ██╗  ██╗███████╗██████╗ ██████╗ ██████╗  ██████╗
 #██╔══██╗██║╚══███╔╝██║ ██╔╝╚██╗ ██╔╝    ██║  ██║██╔════╝████╗  ██║██╔════╝ ██║ ██╔╝██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔═══██╗
 #██████╔╝██║  ███╔╝ █████╔╝  ╚████╔╝     ███████║█████╗  ██╔██╗ ██║██║  ███╗█████╔╝ █████╗  ██████╔╝██████╔╝██████╔╝██║   ██║
 #██╔══██╗██║ ███╔╝  ██╔═██╗   ╚██╔╝      ██╔══██║██╔══╝  ██║╚██╗██║██║   ██║██╔═██╗ ██╔══╝  ██╔══██╗██╔═══╝ ██╔══██╗██║   ██║
 #██║  ██║██║███████╗██║  ██╗   ██║       ██║  ██║███████╗██║ ╚████║╚██████╔╝██║  ██╗███████╗██║  ██║██║     ██║  ██║╚██████╔╝
-#╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝       ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝ ╚═════╝                                                                                                                             
+#╚═╝  ╚═╝╚═╝╚══════╝╚═╝  ╚═╝   ╚═╝       ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝  ╚═╝ ╚═════╝
 # if you copy, haram, unless you ask permission from the author
 # for personal use only, if you use it for commercial purposes, you will be responsible for your own actions
 # =============================================================================
-# candle_stream.py — Bybit Native Kline WebSocket (DATA_MODE = "kline")
-# =============================================================================
 #
 # Aktif jika: DATA_MODE = "kline" di config.py
-# Cara kerja:
-#   1. Subscribe ke topic "kline.{interval}.{SYMBOL}" untuk setiap timeframe.
-#   2. Saat Bybit mengirim candle dengan "confirm": true, candle tersebut sudah
-#      RESMI (ditutup) dan langsung disimpan ke candle_buffers.
-#   3. Sebelum itu, live candle (belum confirm) disimpan ke _current_candle.
-#   4. Menyediakan get_live_data() yang IDENTIK dengan milik data_resampler.py
-#      sehingga strategy.py tidak perlu diubah sama sekali.
+# Cara kerja (CCXT Pro):
+#   1. exchange.watch_ohlcv(symbol, tf) mengembalikan list OHLCV terbaru.
+#   2. Entry terakhir = candle yang sedang berjalan (live/open).
+#   3. Jika open_time entry terakhir BERUBAH dari sebelumnya → candle lama
+#      resmi ditutup dan disimpan ke candle_buffers.
+#   4. Interface get_live_data() identik dengan data_resampler.py —
+#      strategy.py tidak perlu diubah.
 # =============================================================================
 from __future__ import annotations
 
 import time
-import json
 import asyncio
 import logging
 from typing import Optional
-import aiohttp
 from collections import deque
-from config import (
-    SYMBOL, CATEGORY, WS_PUBLIC_URL, REST_BASE_URL,
-    TIMEFRAMES, ORDERBOOK_DEPTH,
-)
+from config import SYMBOL, TIMEFRAMES
 from ft_types import (
     BidAskLevel,
     Candle,
     MarketDataSnapshot,
 )
+from ccxt_client import exchange
+import ccxt_client
 
 # Import orderbook state dari data_stream (tetap dipakai untuk bid/ask/spread)
 import data_stream
@@ -55,27 +53,6 @@ logger = logging.getLogger("candle_stream")
 is_warmup: bool = True
 
 # =============================================================================
-# PETA BYBIT INTERVAL  (detik → string Bybit kline)
-# =============================================================================
-_BYBIT_INTERVAL_MAP: dict[int, str] = {
-    # Catatan: Bybit Kline WS menggunakan satuan MENIT untuk interval string.
-    # Interval sub-menit (1 detik, 5 detik) TIDAK tersedia di Bybit Kline WS public stream.
-    # Entry 1s dan 5s dihapus karena konflik dengan 1m (keduanya map ke "1").
-    # BUG-03 FIX: Removed 1:"1" and 5:"5" entries that caused collision with 60:"1" (1 minute)
-    60:    "1",    # 1 menit
-    180:   "3",
-    300:   "5",
-    900:   "15",
-    1800:  "30",
-    3600:  "60",
-    7200:  "120",
-    14400: "240",
-    21600: "360",
-    43200: "720",
-    86400: "D",
-}
-
-# =============================================================================
 # CANDLE BUFFERS (interface identik dengan data_resampler)
 # =============================================================================
 candle_buffers: dict[str, deque[Candle]] = {
@@ -83,35 +60,31 @@ candle_buffers: dict[str, deque[Candle]] = {
     for tf, (_, size) in TIMEFRAMES.items()
 }
 
-# Candle berjalan (belum confirm / belum tutup) per timeframe
+# Candle berjalan (belum tutup) per timeframe
 _current_candle: dict[str, Optional[Candle]] = {
     tf: None for tf in TIMEFRAMES
 }
 
-# Map label TF ke interval Bybit (untuk subscribe)
-_tf_to_bybit: dict[str, str] = {}
-for tf, (interval_sec, _) in TIMEFRAMES.items():
-    _bi = _BYBIT_INTERVAL_MAP.get(interval_sec)
-    if _bi:
-        _tf_to_bybit[tf] = _bi
-
-# Map "bybit_interval" kembali ke label TF (untuk routing saat terima data)
-_bybit_to_tf: dict[str, str] = {v: k for k, v in _tf_to_bybit.items()}
+# Hanya subscribe TF yang interval >= 60 detik (sub-menit tidak tersedia di Bybit kline)
+_valid_tfs: list[str] = [
+    tf for tf, (interval_sec, _) in TIMEFRAMES.items() if interval_sec >= 60
+]
 
 
 # =============================================================================
-# PRELOAD: Unduh histori dari REST, masukkan ke candle_buffers
+# PRELOAD: Inject historical candles dari REST (dipanggil main.py)
 # =============================================================================
-def preload_candles(tf: str, raw_klines: list[list[str]]) -> int:
+def preload_candles(tf: str, raw_klines: list) -> int:
     """
-    Inject historical candles (Bybit REST format) ke candle_buffers[tf].
-    Format baris: [startTime_ms, open, high, low, close, volume, turnover]
+    Inject historical candles ke candle_buffers[tf].
+    Format input kompatibel dengan CCXT ohlcv: [[ts_ms, o, h, l, c, v], ...]
+    maupun Bybit REST: [[ts_ms_str, o_str, h_str, l_str, c_str, v_str], ...]
     """
     if tf not in candle_buffers:
         logger.warning(f"[PRELOAD] TF tidak dikenal: {tf}")
         return 0
 
-    ordered: list[list[str]] = sorted(raw_klines, key=lambda row: int(row[0]))
+    ordered: list = sorted(raw_klines, key=lambda row: int(row[0]))
     loaded: int = 0
     for row in ordered:
         try:
@@ -137,152 +110,71 @@ def preload_candles(tf: str, raw_klines: list[list[str]]) -> int:
 
 
 # =============================================================================
-# PROSES PESAN KLINE DARI WEBSOCKET
+# PROSES UPDATE OHLCV DARI CCXT PRO
 # =============================================================================
-def _process_kline_message(msg: dict[str, object]) -> None:
+def _process_ohlcv_update(tf: str, row: list) -> None:
     """
-    Tangani pesan kline dari Bybit WebSocket.
-    Format topic: "kline.{interval}.{SYMBOL}"
+    Process satu baris OHLCV dari CCXT Pro: [ts_ms, open, high, low, close, volume].
+    Deteksi candle tutup: jika open_time berubah dari _current_candle[tf],
+    candle lama disimpan ke buffer sebagai candle yang resmi ditutup.
     """
-    topic: str = str(msg.get("topic", ""))
-    # topic contoh: "kline.1.DOGEUSDT" → ambil interval "1"
-    parts: list[str] = topic.split(".")
-    if len(parts) < 2:
-        return
+    open_time_sec: float = float(row[0]) / 1000.0
 
-    bybit_interval: str = parts[1]
+    candle: Candle = {
+        "timeframe":   tf,
+        "open_time":   open_time_sec,
+        "open":        float(row[1]),
+        "high":        float(row[2]),
+        "low":         float(row[3]),
+        "close":       float(row[4]),
+        "volume":      float(row[5]),
+        "buy_volume":  0.0,
+        "sell_volume": 0.0,
+        "tick_count":  0,
+    }
 
-    # Temukan label TF  (bisa ada banyak TF memetakan ke interval yang sama,
-    # misal "1s" dan "1m" keduanya → "1". Kita cocokkan pakai open_time)
-    data_list: list[dict[str, object]] = msg.get("data", [])  # type: ignore[assignment]
-    for kline in data_list:
-        # Cari TF yang cocok berdasarkan interval Bybit
-        tf: Optional[str] = _bybit_to_tf.get(bybit_interval)
-        if tf is None:
-            continue
+    prev: Optional[Candle] = _current_candle[tf]
 
-        confirm: bool   = bool(kline.get("confirm", False))
-        start_ms: int   = int(str(kline.get("start", 0)))
-        candle: Candle  = {
-            "timeframe":   tf,
-            "open_time":   start_ms / 1000.0,
-            "open":        float(str(kline.get("open",   0))),
-            "high":        float(str(kline.get("high",   0))),
-            "low":         float(str(kline.get("low",    0))),
-            "close":       float(str(kline.get("close",  0))),
-            "volume":      float(str(kline.get("volume", 0))),
-            "buy_volume":  0.0,
-            "sell_volume": 0.0,
-            "tick_count":  0,
-        }
+    if prev is not None and prev["open_time"] != open_time_sec:
+        # open_time berubah → candle sebelumnya resmi ditutup
+        candle_buffers[tf].append(dict(prev))  # type: ignore[arg-type]
+        data_stream.last_prices[tf] = prev["close"]
+        if not is_warmup:
+            logger.info(
+                f"[NEW {tf} CANDLE] "
+                f"O:{prev['open']:.5f} | H:{prev['high']:.5f} | "
+                f"L:{prev['low']:.5f} | C:{prev['close']:.5f} | "
+                f"Vol:{prev['volume']:.2f}"
+            )
 
-        if confirm:
-            # Candle RESMI ditutup → simpan ke buffer historis
-            candle_buffers[tf].append(dict(candle))  # type: ignore[arg-type]
-            data_stream.last_prices[tf] = candle["close"]
-            if not is_warmup:
-                logger.info(
-                    f"[NEW {tf} CANDLE] "
-                    f"O:{candle['open']:.5f} | H:{candle['high']:.5f} | "
-                    f"L:{candle['low']:.5f} | C:{candle['close']:.5f} | "
-                    f"Vol:{candle['volume']:.2f}"
-                )
-        else:
-            # Candle masih berjalan → simpan sebagai live candle
-            _current_candle[tf] = candle
-            data_stream.last_prices[tf] = candle["close"]
+    # Update candle yang sedang berjalan
+    _current_candle[tf] = candle
+    data_stream.last_prices[tf] = candle["close"]
 
 
 # =============================================================================
-# WEBSOCKET HANDLER
+# CCXT PRO WATCH LOOP (satu per timeframe)
+# Auto-reconnect ditangani CCXT Pro secara internal.
 # =============================================================================
-async def _ws_handler(ws: aiohttp.ClientWebSocketResponse) -> None:
-    """Dispatcher pesan WebSocket untuk kline + orderbook."""
-    async for msg in ws:
-        if msg.type == aiohttp.WSMsgType.TEXT:
-            try:
-                data: dict[str, object] = json.loads(msg.data)
-
-                # Tangkap error dari Bybit
-                if "success" in data and data["success"] is False:
-                    logger.error(
-                        f"BYBIT ERROR: {data.get('ret_msg', 'Topic ditolak server')}"
-                    )
-
-                topic: str = str(data.get("topic", ""))
-
-                if topic.startswith("kline."):
-                    _process_kline_message(data)
-                # BUG-02 FIX: Orderbook diproses hanya oleh data_stream.py.
-                # Routing ke data_stream._process_orderbook_message() dari sini
-                # dihapus untuk menghindari duplikat write ke orderbook_snapshot.
-
-            except json.JSONDecodeError:
-                pass
-            except Exception as e:
-                logger.error(f"WS handler error: {e}")
-
-        elif msg.type == aiohttp.WSMsgType.ERROR:
-            logger.error(f"WebSocket error: {ws.exception()}")
-            break
-        elif msg.type == aiohttp.WSMsgType.CLOSED:
-            logger.warning("WebSocket connection closed.")
-            break
-
-
-# =============================================================================
-# WEBSOCKET CONNECTION + AUTO-RECONNECT
-# =============================================================================
-async def _connect_websocket(session: aiohttp.ClientSession) -> None:
-    reconnect_delay: int = 1
-    max_delay: int       = 60
-
-    # Bangun daftar kline topics berdasarkan TIMEFRAMES
-    kline_args: list[str]    = []
-    seen_intervals: set[str] = set()
-    for tf, (interval_sec, _) in TIMEFRAMES.items():
-        bi: Optional[str] = _BYBIT_INTERVAL_MAP.get(interval_sec)
-        if bi and bi not in seen_intervals:
-            kline_args.append(f"kline.{bi}.{SYMBOL}")
-            seen_intervals.add(bi)
-
-    # BUG-02 FIX: Orderbook TIDAK disubscribe di sini.
-    # data_stream.py sudah subscribe dan memproses orderbook secara independen.
-    # Subscribe ganda menyebabkan dua WS connection menulis ke orderbook_snapshot
-    # yang sama secara bersamaan (race condition).
-
+async def _watch_ohlcv_loop(tf: str) -> None:
+    """Watch kline untuk satu timeframe via CCXT Pro."""
+    logger.info(f"[{tf}] Starting OHLCV watch for {ccxt_client.CCXT_SYMBOL}...")
     while True:
         try:
-            logger.info(f"Connecting to WebSocket: {WS_PUBLIC_URL}")
-            async with session.ws_connect(
-                WS_PUBLIC_URL,
-                heartbeat=20,
-                receive_timeout=30,
-            ) as ws:
-                reconnect_delay = 1
-
-                subscribe_msg: dict[str, object] = {
-                    "op": "subscribe",
-                    "args": kline_args,
-                }
-                await ws.send_str(json.dumps(subscribe_msg))
-                logger.info(f"Subscribed kline topics: {kline_args}")
-
-                await _ws_handler(ws)
-
+            # CCXT Pro mengembalikan list OHLCV; entry terakhir = candle live
+            ohlcv = await exchange.watch_ohlcv(ccxt_client.CCXT_SYMBOL, timeframe=tf)
+            if ohlcv:
+                _process_ohlcv_update(tf, ohlcv[-1])
         except asyncio.CancelledError:
-            logger.info("Candle stream task cancelled.")
+            logger.info(f"[{tf}] OHLCV watch cancelled.")
             break
         except Exception as e:
-            logger.error(f"WebSocket connection error: {e}")
-
-        logger.info(f"Reconnecting in {reconnect_delay}s...")
-        await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, max_delay)
+            logger.error(f"[{tf}] OHLCV watch error: {e}. Retrying in 1s...")
+            await asyncio.sleep(1)
 
 
 # =============================================================================
-# GET LIVE DATA (identik dengan data_resampler.get_live_data)
+# GET LIVE DATA (interface identik dengan data_resampler.get_live_data)
 # Dipanggil oleh main.py strategy_loop setiap tick
 # =============================================================================
 def get_live_data() -> MarketDataSnapshot:
@@ -305,7 +197,7 @@ def get_live_data() -> MarketDataSnapshot:
         "best_bid":            best_bid_snap,
         "best_ask":            best_ask_snap,
         "bid_ask_spread":      _get_spread(),
-        "orderbook_imbalance": _get_orderbook_imbalance(),  # BUG-11 FIX: hitung dari orderbook_snapshot
+        "orderbook_imbalance": _get_orderbook_imbalance(),
         "volume_delta":        0.0,   # tidak tersedia di mode kline
         "funding_rate":        data_stream.funding_rate.get("value", 0.0),
         "latest_tick":         None,  # tidak ada tick individu di mode kline
@@ -323,8 +215,7 @@ def _get_spread() -> float:
 
 def _get_orderbook_imbalance() -> float:
     """
-    BUG-11 FIX: Hitung orderbook imbalance dari data_stream.orderbook_snapshot.
-    Sebelumnya selalu return 0.0 di kline mode.
+    Hitung orderbook imbalance dari data_stream.orderbook_snapshot.
     Range: -1.0 (tekanan jual penuh) sampai +1.0 (tekanan beli penuh).
     """
     snap = data_stream.orderbook_snapshot
@@ -341,10 +232,15 @@ def _get_orderbook_imbalance() -> float:
 # =============================================================================
 async def start_candle_stream() -> None:
     """
-    Jalankan kline + orderbook WebSocket stream.
-    Dipanggil oleh main.py jika DATA_MODE = "kline".
+    Jalankan kline WebSocket untuk semua timeframe yang valid via CCXT Pro.
+    Menggantikan: manual WS connect + subscribe + message handler + auto-reconnect.
     """
-    logger.info(f"Candle stream started (kline mode) — Symbol: {SYMBOL}")
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        await _connect_websocket(session)
+    logger.info(f"Candle stream started (kline mode via CCXT Pro) — Symbol: {SYMBOL}")
+    logger.info(f"Watching timeframes: {_valid_tfs}")
+
+    if not _valid_tfs:
+        logger.warning("Tidak ada timeframe valid (>= 1m) — candle stream tidak aktif.")
+        return
+
+    # Satu loop per timeframe, dijalankan bersamaan
+    await asyncio.gather(*[_watch_ohlcv_loop(tf) for tf in _valid_tfs])

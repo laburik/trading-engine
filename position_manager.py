@@ -21,13 +21,12 @@
 from __future__ import annotations
 
 import time
-import hmac
-import hashlib
 import asyncio
 import logging
 from typing import Optional
-import aiohttp
-from config import INITIAL_BALANCE, MODE, SYMBOL, CATEGORY, REST_URL, ACTIVE_API_KEY, ACTIVE_API_SECRET, PNL_SYNC_INTERVAL
+from config import INITIAL_BALANCE, MODE, SYMBOL, PNL_SYNC_INTERVAL
+from ccxt_client import exchange
+import ccxt_client
 from trade_logger import log_trade, log_equity
 from ft_types import EquityLogRow, PnlSummary, PositionState
 
@@ -171,60 +170,34 @@ def update_pnl(bid_price: float, ask_price: float) -> None:
 # =============================================================================
 # BYBIT PNL SYNC LOOP (demo / live mode)
 # =============================================================================
-def _bybit_get_headers(query_string: str = "") -> dict[str, str]:
-    """Build signed headers for Bybit REST GET requests."""
-    ts: str = str(int(time.time() * 1000))
-    recv_window: str = "5000"
-    sign_str: str = ts + ACTIVE_API_KEY + recv_window + query_string
-    sign: str = hmac.HMAC(ACTIVE_API_SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-    return {
-        "X-BAPI-API-KEY": ACTIVE_API_KEY,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-RECV-WINDOW": recv_window,
-    }
-
-
-async def _sync_position(session: aiohttp.ClientSession) -> None:
-    """Fetch open position from Bybit and update local state."""
-    query: str = f"category={CATEGORY}&symbol={SYMBOL}"
-    url: str   = f"{REST_URL}/v5/position/list?{query}"
+async def _sync_position() -> None:
+    """Fetch open position dari Bybit via CCXT dan update local state."""
     try:
-        async with session.get(url, headers=_bybit_get_headers(query),
-                               timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            data: dict[str, object] = await resp.json()
-            if data.get("retCode") == 0:
-                result: dict[str, object] = data["result"]  # type: ignore[assignment]
-                positions: list[dict[str, object]] = result["list"]  # type: ignore[assignment]
-                if positions and float(positions[0].get("size", 0)) > 0:  # type: ignore[arg-type]
-                    pos: dict[str, object] = positions[0]
-                    side_raw: str = str(pos.get("side", "")).lower()   # "Buy" → "long", "Sell" → "short"
-                    _state["side"] = "long" if side_raw == "buy" else "short"
-                    _state["entry_price"] = float(pos.get("avgPrice", 0))  # type: ignore[arg-type]
-                    _state["qty"] = float(pos.get("size", 0))  # type: ignore[arg-type]
-                    _state["unrealized_pnl"] = float(pos.get("unrealisedPnl", 0))  # type: ignore[arg-type]
-                else:
-                    _state["side"] = "none"
-                    _state["qty"] = 0.0
-                    _state["unrealized_pnl"] = 0.0
+        positions = await exchange.fetch_positions([ccxt_client.CCXT_SYMBOL])
+        # CCXT returns list; filter posisi aktif (contracts > 0)
+        active = [p for p in positions if float(p.get("contracts") or 0) > 0]
+        if active:
+            pos = active[0]
+            side_raw: str = str(pos.get("side", "")).lower()  # "long" or "short"
+            _state["side"] = side_raw if side_raw in ("long", "short") else "none"
+            _state["entry_price"] = float(pos.get("entryPrice") or 0)
+            _state["qty"]         = float(pos.get("contracts") or 0)
+            _state["unrealized_pnl"] = float(pos.get("unrealizedPnl") or 0)
+        else:
+            _state["side"]           = "none"
+            _state["qty"]            = 0.0
+            _state["unrealized_pnl"] = 0.0
     except Exception as e:
         logger.warning(f"[PNL SYNC] Position fetch error: {e}")
 
 
-async def _sync_balance(session: aiohttp.ClientSession) -> None:
-    """Fetch wallet balance/equity from Bybit and update local state."""
-    query: str = "accountType=UNIFIED"
-    url: str   = f"{REST_URL}/v5/account/wallet-balance?{query}"
+async def _sync_balance() -> None:
+    """Fetch wallet balance dari Bybit via CCXT dan update local state."""
     try:
-        async with session.get(url, headers=_bybit_get_headers(query),
-                               timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            data: dict[str, object] = await resp.json()
-            if data.get("retCode") == 0:
-                result: dict[str, object] = data["result"]  # type: ignore[assignment]
-                account_list: list[dict[str, object]] = result["list"]  # type: ignore[assignment]
-                acct: dict[str, object] = account_list[0]
-                _state["balance"] = float(acct.get("totalWalletBalance", _state["balance"]))  # type: ignore[arg-type]
-                _state["equity"]  = float(acct.get("totalEquity", _state["equity"]))  # type: ignore[arg-type]
+        balance = await exchange.fetch_balance()
+        usdt = balance.get("USDT", {})
+        wallet = float(usdt.get("total") or _state["balance"])
+        _state["balance"] = wallet
     except Exception as e:
         logger.warning(f"[PNL SYNC] Balance fetch error: {e}")
 
@@ -244,27 +217,25 @@ async def start_pnl_sync_loop() -> None:
         return  # not needed in paper mode
 
     logger.info(f"[PNL SYNC] Starting for MODE={MODE}, interval={PNL_SYNC_INTERVAL}s")
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        while True:
-            await _sync_position(session)
-            await _sync_balance(session)
+    while True:
+        await _sync_position()
+        await _sync_balance()
 
-            # Recalculate equity from fetched data
-            _state["equity"] = _state["balance"] + _state["unrealized_pnl"]
+        # Recalculate equity from fetched data
+        _state["equity"] = _state["balance"] + _state["unrealized_pnl"]
 
-            now: float = time.time()
-            if now - _last_equity_log_time >= 60.0:
-                equity_row: EquityLogRow = {
-                    "timestamp": now,
-                    "balance": _state["balance"],
-                    "equity": _state["equity"],
-                    "unrealized_pnl": _state["unrealized_pnl"],
-                }
-                log_equity(equity_row)
-                _last_equity_log_time = now
+        now: float = time.time()
+        if now - _last_equity_log_time >= 60.0:
+            equity_row: EquityLogRow = {
+                "timestamp": now,
+                "balance": _state["balance"],
+                "equity": _state["equity"],
+                "unrealized_pnl": _state["unrealized_pnl"],
+            }
+            log_equity(equity_row)
+            _last_equity_log_time = now
 
-            await asyncio.sleep(PNL_SYNC_INTERVAL)
+        await asyncio.sleep(PNL_SYNC_INTERVAL)
 
 
 # =============================================================================
@@ -274,24 +245,15 @@ async def initial_sync() -> None:
     """
     Lakukan satu kali sync balance dan posisi dari Bybit sebelum strategy loop
     dimulai (hanya untuk mode demo/live).
-
-    Tujuan:
-    - Mencegah balance awal salah (default INITIAL_BALANCE=1000 USDT) saat
-      bot pertama kali mulai di demo/live.
-    - Memastikan kalkulasi ORDER_SIZE_USDT berbasis equity sudah akurat sejak
-      detik pertama, tidak menunggu sync pertama dari start_pnl_sync_loop.
-    - Dipanggil sekali dari main.py setelah preload_all_timeframes() selesai.
     """
     if MODE == "paper":
         return  # paper mode tidak butuh sync dari Bybit
 
     logger.info("[PNL SYNC] Running initial_sync() before strategy starts...")
     try:
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            await _sync_position(session)
-            await _sync_balance(session)
-            _state["equity"] = _state["balance"] + _state["unrealized_pnl"]
+        await _sync_position()
+        await _sync_balance()
+        _state["equity"] = _state["balance"] + _state["unrealized_pnl"]
         logger.info(
             f"[PNL SYNC] Initial sync done. "
             f"Balance={_state['balance']:.2f} USDT | "

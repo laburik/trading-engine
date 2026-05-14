@@ -3,6 +3,8 @@ chcp 65001 >nul 2>&1
 title Trading Bot - Auto Setup & Run
 color 0A
 
+cd /d "%~dp0"
+
 echo ==================================================
 echo   TRADING BOT - AUTO SETUP ^& RUN
 echo ==================================================
@@ -13,15 +15,12 @@ python --version >nul 2>&1
 if errorlevel 1 (
     echo [ERROR] Python tidak ditemukan!
     echo.
-    echo Silakan download Python 3.10+ dari:
-    echo   https://www.python.org/downloads/
-    echo.
+    echo Download Python 3.10+ dari: https://www.python.org/downloads/
     echo PENTING: Centang "Add Python to PATH" saat install.
     echo.
     pause
     exit /b 1
 )
-
 for /f "tokens=2 delims= " %%v in ('python --version 2^>^&1') do set PYVER=%%v
 echo [OK] Python %PYVER% ditemukan.
 
@@ -38,14 +37,22 @@ if not exist ".venv\Scripts\activate.bat" (
     echo [OK] Virtual environment dibuat.
 )
 
-:: AKTIFKAN VENV
+:: AKTIFKAN VENV  (tidak cek errorlevel — activate.bat tidak reliable)
 call .venv\Scripts\activate.bat
 echo [OK] Virtual environment aktif.
+
+:: CEK APAKAH VENV BENAR-BENAR AKTIF
+python -c "import sys; sys.exit(0 if '.venv' in sys.prefix else 1)" >nul 2>&1
+if errorlevel 1 (
+    echo [ERROR] Virtual environment gagal aktif. Coba hapus folder .venv dan jalankan ulang.
+    pause
+    exit /b 1
+)
 
 :: INSTALL DEPENDENCIES
 echo.
 echo [SETUP] Menginstall dependencies (mungkin butuh beberapa menit)...
-pip install -r requirements.txt --quiet --disable-pip-version-check
+pip install -r requirements.txt --disable-pip-version-check
 if errorlevel 1 (
     echo.
     echo [ERROR] Gagal install dependencies.
@@ -54,6 +61,8 @@ if errorlevel 1 (
     exit /b 1
 )
 echo [OK] Semua dependencies terinstall.
+
+:: HAPUS aiodns yang membreak DNS setelah install ccxt
 
 :: CEK FILE .env
 if not exist ".env" (
@@ -87,7 +96,7 @@ echo   [3] Jalankan KEDUANYA (bot + dashboard)
 echo   [4] Validasi strategy.py
 echo ==================================================
 echo.
-set /p CHOICE=Pilihan kamu (1/2/3/4): 
+set /p CHOICE=Pilihan kamu (1/2/3/4):
 
 if "%CHOICE%"=="1" goto RUN_BOT
 if "%CHOICE%"=="2" goto RUN_DASH
@@ -118,7 +127,7 @@ exit /b 0
 :RUN_BOTH
 echo.
 echo [START] Menjalankan Bot di window terpisah...
-start "Trading Bot" cmd /k "cd /d "%~dp0" && call .venv\Scripts\activate.bat && python main.py"
+start "Trading Bot" /D "%~dp0" cmd /k "call .venv\Scripts\activate.bat && python main.py"
 timeout /t 3 >nul
 echo [START] Menjalankan Dashboard...
 echo         Buka browser: http://localhost:8501

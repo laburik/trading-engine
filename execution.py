@@ -25,21 +25,17 @@ from __future__ import annotations
 
 import asyncio
 import time
-import hmac
-import hashlib
-import json
 import logging
-import uuid
 import math
 from typing import Optional
-import aiohttp
+import ccxt.pro as ccxt
 from config import (
-    ACTIVE_API_KEY as API_KEY,
-    ACTIVE_API_SECRET as API_SECRET,
-    SYMBOL, CATEGORY, MODE,
+    SYMBOL, MODE,
     ORDER_SIZE_USDT, LEVERAGE, SLIPPAGE_TOLERANCE,
-    MAX_RETRY, RETRY_DELAY_MS, CANCEL_ON_PARTIAL, REST_URL, FEE_RATE,
+    MAX_RETRY, RETRY_DELAY_MS, CANCEL_ON_PARTIAL, FEE_RATE,
 )
+from ccxt_client import exchange
+import ccxt_client
 from ft_types import OrderResult, Signal
 
 logging.basicConfig(
@@ -65,26 +61,19 @@ _qty_step_cache: Optional[float] = None
 
 
 async def _get_qty_step() -> float:
+    """Ambil qtyStep dari cache CCXT market info (tidak butuh HTTP request ulang)."""
     global _qty_step_cache
     if _qty_step_cache is not None:
         return _qty_step_cache
-
-    url: str = f"{REST_URL}/v5/market/instruments-info?category={CATEGORY}&symbol={SYMBOL}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                data: dict[str, object] = await resp.json()
-                if data.get("retCode") == 0:
-                    result: dict[str, object] = data["result"]  # type: ignore[assignment]
-                    list_data: list[dict[str, object]] = result["list"]  # type: ignore[assignment]
-                    if list_data:
-                        lot_filter: dict[str, str] = list_data[0]["lotSizeFilter"]  # type: ignore[assignment]
-                        _qty_step_cache = float(lot_filter["qtyStep"])
-                        logger.info(f"Loaded qtyStep for {SYMBOL}: {_qty_step_cache}")
-                        return _qty_step_cache
+        # exchange.market() membaca dari cache load_markets() — tidak ada network call
+        market = exchange.market(ccxt_client.CCXT_SYMBOL)
+        step: float = float(market["precision"]["amount"])
+        _qty_step_cache = step
+        logger.info(f"Loaded qtyStep for {SYMBOL}: {step}")
+        return step
     except Exception as e:
-        logger.error(f"Failed to fetch qtyStep: {e}")
-
+        logger.error(f"Failed to fetch qtyStep from CCXT market info: {e}")
     return 0.001
 
 
@@ -94,26 +83,6 @@ def _round_to_step(value: float, step: float) -> float:
     precision: int = max(0, int(round(-math.log10(step))))
     rounded: float = math.floor(value / step) * step
     return round(rounded, precision)
-
-
-# =============================================================================
-# BYBIT SIGNATURE HELPER (for live mode)
-# =============================================================================
-def _bybit_signature(params: dict[str, object], timestamp: int) -> str:
-    param_str: str = f"{timestamp}{API_KEY}5000" + "&".join(
-        f"{k}={v}" for k, v in sorted(params.items())
-    )
-    return hmac.HMAC(API_SECRET.encode(), param_str.encode(), hashlib.sha256).hexdigest()
-
-
-def _build_headers(timestamp: int, sign: str) -> dict[str, str]:
-    return {
-        "X-BAPI-API-KEY": API_KEY,
-        "X-BAPI-TIMESTAMP": str(timestamp),
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-RECV-WINDOW": "5000",
-        "Content-Type": "application/json",
-    }
 
 
 # =============================================================================
@@ -291,8 +260,8 @@ async def _paper_execute_loop(signal: Signal) -> None:
 
 async def _live_place_order_async(signal: Signal) -> OrderResult:
     """
-    Execute order via Bybit REST API (async).
-    Used internally by place_order when MODE == "live".
+    Execute order via CCXT (Bybit REST API, async).
+    CCXT menangani signing, header, dan parsing response secara otomatis.
     """
     action: str = signal["action"]
     pos: dict[str, object] = position_manager.get_position()
@@ -300,23 +269,19 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
     ask: float = data_stream.best_ask.get("price", 0.0)
     bid: float = data_stream.best_bid.get("price", 0.0)
 
-    # Determine side and price
-    side: str
+    # Tentukan side dan harga eksekusi
+    ccxt_side: str
     price: float
     if action == "buy":
-        side = "Buy"
-        price = ask
+        ccxt_side, price = "buy", ask
     elif action == "sell":
-        side = "Sell"
-        price = bid
+        ccxt_side, price = "sell", bid
     elif action == "close":
         pos_side: str = str(pos["side"])
         if pos_side == "long":
-            side = "Sell"
-            price = bid
+            ccxt_side, price = "sell", bid
         elif pos_side == "short":
-            side = "Buy"
-            price = ask
+            ccxt_side, price = "buy", ask
         else:
             return {"status": "skipped", "reason": "No position to close"}
     else:
@@ -334,8 +299,6 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
     else:
         qty = qty_val
 
-    qty_str: str = f"{qty:g}"
-
     # Slippage check
     validate_side: str = action if action != "close" else ("sell" if str(pos["side"]) == "long" else "buy")
     ok: bool
@@ -345,66 +308,41 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
         logger.warning(err)
         return {"status": "rejected", "reason": err}
 
-    payload: dict[str, object] = {
-        "category": CATEGORY,
-        "symbol": SYMBOL,
-        "side": side,
-        "orderType": "Market",
-        "qty": qty_str,
-        "timeInForce": "GoodTillCancel",
-        "reduceOnly": action == "close",
-        "closeOnTrigger": False,
-    }
+    reduce_only: bool = (action == "close")
 
-    url: str = f"{REST_URL}/v5/order/create"
+    for attempt in range(1, MAX_RETRY + 1):
+        try:
+            order = await exchange.create_order(
+                symbol=ccxt_client.CCXT_SYMBOL,
+                type="market",
+                side=ccxt_side,
+                amount=qty,
+                params={
+                    "reduceOnly":    reduce_only,
+                    "timeInForce":   "GoodTillCancel",
+                    "closeOnTrigger": False,
+                },
+            )
+            order_id: str = str(order.get("id", ""))
+            logger.info(f"[LIVE] Order placed: {ccxt_side} {qty} {SYMBOL} @ market | orderId={order_id}")
+            return {"status": "filled", "price": price, "qty": qty, "orderId": order_id}
 
-    # NEW-01 FIX: Buat satu ClientSession di luar retry loop.
-    # Sebelumnya session dibuat di dalam loop → hingga MAX_RETRY sesi baru per order
-    # tanpa cleanup → memory/connection leak saat trading aktif.
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        for attempt in range(1, MAX_RETRY + 1):
-            try:
-                timestamp: int = int(time.time() * 1000)
-                body: str = json.dumps(payload)
-                sign: str = hmac.HMAC(
-                    API_SECRET.encode(),
-                    f"{timestamp}{API_KEY}5000{body}".encode(),
-                    hashlib.sha256,
-                ).hexdigest()
+        except ccxt.BadRequest as e:
+            # Fix 4: Bybit Hedge Mode menolak reduceOnly=True
+            # → Retry tanpa flag agar order close tetap berhasil.
+            if reduce_only and ("reduceOnly" in str(e) or "110025" in str(e)):
+                logger.warning(
+                    "[LIVE] reduceOnly ditolak Bybit (Hedge Mode terdeteksi). "
+                    "Retry tanpa reduceOnly..."
+                )
+                reduce_only = False
+                continue
+            logger.warning(f"[LIVE] Order attempt {attempt} BadRequest: {e}")
 
-                headers: dict[str, str] = _build_headers(timestamp, sign)
+        except Exception as e:
+            logger.error(f"[LIVE] Order attempt {attempt} exception: {e}")
 
-                async with session.post(url, headers=headers, data=body,
-                                        timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    result_data: dict[str, object] = await resp.json()
-                    ret_code: int = int(str(result_data.get("retCode", -1)))
-
-                    if ret_code == 0:
-                        result_obj: dict[str, object] = result_data["result"]  # type: ignore[assignment]
-                        order_id: str = str(result_obj.get("orderId", ""))
-                        logger.info(f"[LIVE] Order placed: {side} {qty} {SYMBOL} @ market | orderId={order_id}")
-                        return {"status": "filled", "price": price, "qty": qty, "orderId": order_id}
-
-                    # Fix 4: Bybit Hedge Mode menolak reduceOnly=True (retCode 10001)
-                    # → Retry tanpa flag tersebut agar order close tetap berhasil.
-                    elif ret_code == 10001 and payload.get("reduceOnly"):
-                        logger.warning(
-                            "[LIVE] reduceOnly ditolak Bybit (Hedge Mode terdeteksi). "
-                            "Retry tanpa reduceOnly..."
-                        )
-                        payload["reduceOnly"] = False
-                        body = json.dumps(payload)  # rebuild body dengan flag baru
-                        continue
-
-                    else:
-                        msg: str = str(result_data.get("retMsg", "Unknown error"))
-                        logger.warning(f"[LIVE] Order attempt {attempt} failed: retCode={ret_code} | {msg}")
-
-            except Exception as e:
-                logger.error(f"[LIVE] Order attempt {attempt} exception: {e}")
-
-            await asyncio.sleep(RETRY_DELAY_MS / 1000)
+        await asyncio.sleep(RETRY_DELAY_MS / 1000)
 
     return {"status": "failed", "reason": "Max retries exceeded"}
 
