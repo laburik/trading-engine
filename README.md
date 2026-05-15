@@ -174,10 +174,11 @@ def generate_signal(data):
     return {"action": "hold", "reason": "Tidak ada sinyal"}
 
 def on_tick(data):
-    import execution
+    import execution, bot_monitor
     signal = generate_signal(data)
     if signal["action"] != "hold":
         execution.place_order(signal)
+    bot_monitor.record_tick(signal, data=data)   # WAJIB — tanpa ini dashboard stuck di STARTING
 ```
 
 ### Data tersedia di `data` dict
@@ -299,6 +300,7 @@ bot/
 ├── preflight_check.py    ←  Validator strategy.py (16 cek: error + warning)
 ├── config.py             ←  Konfigurasi semua parameter (termasuk DATA_MODE)
 ├── ft_types.py           ←  Pusat definisi tipe data (TypedDict: Candle, Signal, dll)
+├── ccxt_client.py        ←  Wrapper CCXT Pro (init exchange, fetch market info, close)
 ├── .env.example          ←  Template API Key — copy ke .env dan isi
 ├── data_stream.py        ← WebSocket orderbook + funding rate + heartbeat
 ├── candle_stream.py      ← Bybit Kline WebSocket (aktif jika DATA_MODE="kline")

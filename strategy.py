@@ -1,330 +1,313 @@
-from __future__ import annotations
+# =============================================================================
+# strategy.py — Trading Strategy (USER ONLY EDITS THIS FILE)
+# =============================================================================
+#
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║  THIS IS THE ONLY FILE YOU NEED TO MODIFY.                              ║
+# ║  All data, execution, logging, and monitoring are handled automatically. ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+#
+# STRATEGI : Squeeze Momentum Strategy [LazyBear] — Ported from Pine Script v6
+# COCOK UNTUK  : DOGEUSDT.P  |  Timeframe: 2h (7200 detik)
+#
+# LOGIKA:
+#   - Hitung Bollinger Bands (BB) dan Keltner Channel (KC)
+#   - sqzOn  = BB berada di dalam KC → pasar sedang squeeze (low volatility)
+#   - sqzOff = BB keluar dari KC     → volatilitas meledak
+#   - val (momentum) = linear regression dari (close - midpoint KC)
+#   - LONG  : val memotong 0 dari bawah ke atas (crossover)
+#   - SHORT : val memotong 0 dari atas ke bawah (crossunder)
+#
+# INPUTS: (via data argument dari get_live_data())
+#   data["candles"]["2h"]         → List of 2-hour closed candles (WAJIB)
+#   data["current"]["2h"]         → Live (open) 2-hour candle, updated every tick
+#   data["best_bid"]              → {"price": float, "qty": float}
+#   data["best_ask"]              → {"price": float, "qty": float}
+#   data["bid_ask_spread"]        → ask - bid (float)
+#   data["funding_rate"]          → Current funding rate (float)
+#
+# CATATAN config.py:
+#   Pastikan timeframe "2h" sudah didaftarkan di TIMEFRAMES:
+#       TIMEFRAMES = {
+#           "2h": (7200, 100),   # 2 jam = 7200 detik, simpan 100 candle
+#       }
+#
+# SIGNAL FORMAT:
+#   {"action": "buy" | "sell" | "close" | "hold", "reason": "str"}
+# =============================================================================
 
-import pandas as pd
+import logging
 import numpy as np
-import joblib
-import os
-import sys
-import time
-import warnings
-import types as _types
-from typing import Any, Optional
+from execution import place_order
+from position_manager import get_position, get_pnl_summary
 
-from ft_types import BotState, MarketDataSnapshot, Signal
+logger = logging.getLogger("strategy")
 
-# ==========================================
-# 1. INISIALISASI MODEL ML & SCALER (OPSIONAL)
-# ==========================================
-# ML sepenuhnya opsional — jika file .pkl tidak ditemukan, model = None
-# dan strategy bisa tetap jalan menggunakan logika indikator biasa.
-MODEL_PATH  = 'trading_model_15m.pkl'
-SCALER_PATH = 'trading_scaler_15m.pkl'
+# =============================================================================
+# USER PARAMETERS
+# =============================================================================
+# Squeeze Momentum parameters (sesuai Pine Script asli)
+BB_LENGTH   = 20     # Bollinger Band period
+BB_MULT     = 2.0    # Bollinger Band multiplier (std dev)
+KC_LENGTH   = 20     # Keltner Channel period
+KC_MULT     = 1.5    # Keltner Channel multiplier (ATR/range)
+USE_TRUE_RANGE = True  # True = pakai True Range untuk KC; False = pakai High-Low
 
-try:
-    from sklearn.exceptions import InconsistentVersionWarning
-    warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
-except ImportError:
-    pass  # sklearn tidak terinstall → tidak apa-apa jika tidak pakai ML
+# Risk management
+STOP_LOSS_PCT   = 0.008   # 0.8% stop-loss dari entry
+TAKE_PROFIT_PCT = 0.020   # 2.0% take-profit dari entry
+MAX_SPREAD_USDT = 0.0005  # Maksimum bid-ask spread yang masih diterima
 
-# Cache model ke sys.modules agar hanya di-load 1x per proses
-# (mencegah error "cannot load module more than once" dari sklearn C-extensions)
-if '_strategy_ml_cache' not in sys.modules:
-    _cache = _types.ModuleType('_strategy_ml_cache')
-    _cache.model  = None  # type: ignore[attr-defined]
-    _cache.scaler = None  # type: ignore[attr-defined]
-    if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
-        try:
-            _cache.model  = joblib.load(MODEL_PATH)   # type: ignore[attr-defined]
-            _cache.scaler = joblib.load(SCALER_PATH)  # type: ignore[attr-defined]
-            print(f"[STRATEGY] [OK] Model ML dimuat dari '{MODEL_PATH}'")
-        except Exception as _e:
-            print(f"[STRATEGY] [WARN] Gagal load model ML: {_e} - Strategy jalan tanpa ML.")
+# Minimum candle history yang dibutuhkan sebelum sinyal dihitung
+MIN_CANDLES = KC_LENGTH + 5
+
+# Timeframe yang dipakai strategi ini
+TF = "2h"
+
+
+# =============================================================================
+# HELPER: Hitung nilai linear regression (titik terakhir)
+# Setara dengan ta.linreg(source, length, 0) di Pine Script
+# =============================================================================
+def _linreg(series: list[float], length: int) -> float:
+    """Return the last value of a linear regression line fitted over `length` bars."""
+    if len(series) < length:
+        return 0.0
+    y = np.array(series[-length:], dtype=float)
+    x = np.arange(length, dtype=float)
+    # Least-squares fit
+    coeffs = np.polyfit(x, y, 1)
+    # Value at last index (x = length - 1)
+    return float(coeffs[0] * (length - 1) + coeffs[1])
+
+
+# =============================================================================
+# HELPER: Ambil field dari list candle
+# Setiap candle adalah dict: {open, high, low, close, volume, timestamp}
+# =============================================================================
+def _field(candles: list[dict], key: str) -> list[float]:
+    return [float(c[key]) for c in candles]
+
+
+# =============================================================================
+# CORE: Hitung Squeeze Momentum value (val) untuk seluruh candle history
+# Return: (val_now, val_prev, sqzOn, sqzOff, noSqz)
+# =============================================================================
+def _compute_sqzmom(candles: list[dict]) -> tuple:
+    if len(candles) < MIN_CANDLES:
+        return None
+
+    closes = _field(candles, "close")
+    highs  = _field(candles, "high")
+    lows   = _field(candles, "low")
+
+    n = len(candles)
+
+    # ---------- Bollinger Bands ----------
+    bb_src  = np.array(closes, dtype=float)
+    bb_sma  = np.mean(bb_src[-BB_LENGTH:])
+    bb_std  = np.std(bb_src[-BB_LENGTH:], ddof=1)   # Pine pakai stdev sample
+    upper_bb = bb_sma + BB_MULT * bb_std
+    lower_bb = bb_sma - BB_MULT * bb_std
+
+    # ---------- Keltner Channel ----------
+    kc_src  = np.array(closes, dtype=float)
+    kc_ma   = np.mean(kc_src[-KC_LENGTH:])
+
+    # True Range atau High-Low
+    if USE_TRUE_RANGE:
+        tr_list = []
+        for i in range(max(1, n - KC_LENGTH), n):
+            prev_close = closes[i - 1] if i > 0 else closes[i]
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - prev_close),
+                abs(lows[i]  - prev_close)
+            )
+            tr_list.append(tr)
+        rangema = np.mean(tr_list)
     else:
-        print(f"[STRATEGY] [INFO] File .pkl tidak ditemukan - Strategy jalan tanpa ML (pure indicator mode).")
-    sys.modules['_strategy_ml_cache'] = _cache
+        hl_list = [highs[i] - lows[i] for i in range(max(0, n - KC_LENGTH), n)]
+        rangema = np.mean(hl_list)
 
-_ml_cache: Any = sys.modules['_strategy_ml_cache']
-model  = _ml_cache.model
-scaler = _ml_cache.scaler
+    upper_kc = kc_ma + rangema * KC_MULT
+    lower_kc = kc_ma - rangema * KC_MULT
 
-# Flag untuk dipakai di generate_signal()
-ML_ENABLED: bool = (model is not None and scaler is not None)
+    # ---------- Squeeze State ----------
+    sqzOn  = (lower_bb > lower_kc) and (upper_bb < upper_kc)
+    sqzOff = (lower_bb < lower_kc) and (upper_bb > upper_kc)
+    noSqz  = (not sqzOn) and (not sqzOff)
 
-# ==========================================
-# 2. STATE MANAGER (UNTUK TRIPLE BARRIER)
-# ==========================================
-TARGET_TP_PCT: float = 0.004  # 0.4% Take Profit target
-TARGET_SL_PCT: float = 0.004  # 0.4% Stop Loss target
-TIME_STOP_SEC: int   = 3600   # 1 Jam Time Stop target
+    # ---------- Momentum (val) ----------
+    # avgValue = average( average(highestHigh, lowestLow), sma(close, KC_LENGTH) )
+    highest_high = max(highs[-KC_LENGTH:])
+    lowest_low   = min(lows[-KC_LENGTH:])
+    sma_close    = np.mean(closes[-KC_LENGTH:])
+    avg_value    = ((highest_high + lowest_low) / 2 + sma_close) / 2
 
-# Menyimpan status posisi berjalan secara internal untuk eksekusi Stop Loss, Take Profit, dan Time Stop
-bot_state: BotState = {
-    "in_position": False,
-    "side": "none",       # BUG-04 FIX: tambah side tracking untuk short support
-    "entry_price": 0.0,
-    "entry_time": 0.0
-}
+    # source - avgValue → apply linear regression over KC_LENGTH bars
+    delta = [c - avg_value for c in closes]
+    val_now  = _linreg(delta, KC_LENGTH)
 
-# Minimum candle warmup sebelum strategi mulai
-MIN_CANDLES: int = 50
+    # val satu bar sebelumnya (butuh satu bar lebih)
+    if len(candles) >= MIN_CANDLES + 1:
+        closes_p = closes[:-1]
+        highs_p  = highs[:-1]
+        lows_p   = lows[:-1]
+        hh_p = max(highs_p[-KC_LENGTH:])
+        ll_p = min(lows_p[-KC_LENGTH:])
+        avg_p = ((hh_p + ll_p) / 2 + np.mean(closes_p[-KC_LENGTH:])) / 2
+        delta_p = [c - avg_p for c in closes_p]
+        val_prev = _linreg(delta_p, KC_LENGTH)
+    else:
+        val_prev = val_now  # tidak ada crossover pada bar pertama
 
-# Cache feature engineering — skip recompute jika candle belum berubah
-_feat_cache: dict = {"key": None, "baris_terbaru": None}
-
-# ==========================================
-# 3. LOGIKA UTAMA BOT
-# ==========================================
-def generate_signal(data: MarketDataSnapshot) -> Signal:
-    global bot_state
-
-    # Cegah aktivitas trading jika engine masih tahap preload data historis
-    if data.get("is_warmup", True):
-        return {"action": "hold", "reason": "Sistem sedang Warmup Data Historis"}
-
-    # Ambil candle dari timeframe apapun yang dikirim engine (bukan hardcode "15m")
-    candles_tf: dict[str, object] = {}
-    if data.get("candles"):
-        # Ambil timeframe pertama yang ada
-        for _tf_key, _clist in data["candles"].items():
-            if _clist:
-                candles_tf = {"tf": _tf_key, "list": _clist}
-                break
-
-    candles_list: list[object] = candles_tf.get("list", [])  # type: ignore[assignment]
-    if len(candles_list) < 50:
-        return {"action": "hold", "reason": f"Menunggu buffer candle mencapai 50 (sekarang {len(candles_list)})"}
-
-    # Konversi ke Pandas DataFrame
-    df: pd.DataFrame = pd.DataFrame(candles_list)
-
-    # Ekstrak harga/waktu
-    current_close: float = float(df['close'].iloc[-1])
-    best_ask_data: dict[str, float] = data.get("best_ask", {})  # type: ignore[assignment]
-    best_bid_data: dict[str, float] = data.get("best_bid", {})  # type: ignore[assignment]
-    current_ask: float = best_ask_data.get("price", current_close)
-    current_bid: float = best_bid_data.get("price", current_close)
-
-    # ⚠️ PENTING: Gunakan open_time candle sebagai referensi waktu.
-    # Ini membuat Time Stop bekerja baik saat LIVE maupun saat BACKTEST.
-    # Jika pakai time.time(), backtest yang selesai dalam detik tidak akan pernah
-    # memicu Time Stop karena elapsed time selalu mendekati 0.
-    #
-    # Format data["current"] = {"15m": {open_time: ..., close: ...}}
-    # Ambil candle dict dari value pertama (apapun timeframe-nya)
-    _current_dict: dict[str, object] = data.get("current", {})  # type: ignore[assignment]
-    _candle_obj: object = next(iter(_current_dict.values()), {}) if _current_dict else {}
-    candle_time: float = float(_candle_obj.get("open_time", 0)) if isinstance(_candle_obj, dict) else 0.0  # type: ignore[union-attr]
-    # Fallback ke waktu sekarang hanya jika tidak ada data candle (mode live tanpa current)
-    current_time: float = candle_time if candle_time > 0 else time.time()
-
-    # ---------------------------------------------------------
-    # A. LOGIKA KELUAR (EXIT: TRIPLE BARRIER)
-    # ---------------------------------------------------------
-    if bot_state["in_position"]:
-        entry_price: float = bot_state["entry_price"]
-        pos_side: str      = bot_state.get("side", "long")  # BUG-04 FIX: gunakan side yang disimpan
-
-        if pos_side == "long":
-            # Barrier 1 & 2: Take Profit dan Stop Loss untuk LONG
-            tp_price: float = entry_price * (1 + TARGET_TP_PCT)
-            sl_price: float = entry_price * (1 - TARGET_SL_PCT)
-
-            if current_bid <= sl_price:
-                bot_state["in_position"] = False
-                bot_state["side"] = "none"
-                return {"action": "close", "reason": f"[LONG] Hit SL Darurat (-{TARGET_SL_PCT*100}%)"}
-
-            if current_bid >= tp_price:
-                bot_state["in_position"] = False
-                bot_state["side"] = "none"
-                return {"action": "close", "reason": f"[LONG] Hit TP Target (+{TARGET_TP_PCT*100}%)"}
-
-        else:  # short
-            # BUG-04 FIX: Triple Barrier untuk SHORT (SL/TP dibalik)
-            tp_price = entry_price * (1 - TARGET_TP_PCT)  # TP saat harga TURUN
-            sl_price = entry_price * (1 + TARGET_SL_PCT)  # SL saat harga NAIK
-
-            if current_ask >= sl_price:
-                bot_state["in_position"] = False
-                bot_state["side"] = "none"
-                return {"action": "close", "reason": f"[SHORT] Hit SL Darurat (+{TARGET_SL_PCT*100}%)"}
-
-            if current_ask <= tp_price:
-                bot_state["in_position"] = False
-                bot_state["side"] = "none"
-                return {"action": "close", "reason": f"[SHORT] Hit TP Target (-{TARGET_TP_PCT*100}%)"}
-
-        # Barrier 3: Time Stop (berlaku untuk LONG dan SHORT)
-        if bot_state["entry_time"] > 0:
-            time_elapsed: float = current_time - bot_state["entry_time"]
-            if time_elapsed >= TIME_STOP_SEC:
-                bot_state["in_position"] = False
-                bot_state["side"] = "none"
-                return {"action": "close", "reason": f"Hit Time Stop ({TIME_STOP_SEC} Detik Berlalu)"}
-
-        # Jika belum menyentuh barrier apa-apa, tahan posisi
-        return {"action": "hold", "reason": "Posisi terbuka, memantau Triple Barrier..."}
-
-    # ---------------------------------------------------------
-    # B. LOGIKA MASUK (ENTRY: MACHINE LEARNING & FEATURE ENGINEERING)
-    # ---------------------------------------------------------
-    try:
-        fitur_wajib: list[str] = [
-            'volume', 'return', 'return_lag_1', 'volume_lag_1',
-            'return_lag_3', 'volume_lag_3', 'return_lag_5', 'volume_lag_5',
-            'vol_ma_20', 'vol_surge_ratio', 'RSI_14', 'MACD'
-        ]
-
-        # Cache key: (jumlah candle, open_time candle terakhir)
-        # Jika candle belum berubah sejak tick lalu, skip seluruh feature engineering
-        _last_open_time = candles_list[-1].get("open_time", 0) if isinstance(candles_list[-1], dict) else 0
-        _cache_key = (len(candles_list), _last_open_time)
-
-        if _feat_cache["key"] == _cache_key and _feat_cache["baris_terbaru"] is not None:
-            baris_terbaru: pd.DataFrame = _feat_cache["baris_terbaru"]
-        else:
-            # 1. Fitur Pergerakan & Lag
-            df['return'] = df['close'].pct_change()
-            for i in [1, 3, 5]:
-                df[f'return_lag_{i}'] = df['return'].shift(i)
-                df[f'volume_lag_{i}'] = df['volume'].shift(i)
-
-            # 2. Fitur Momentum Volume (Surge Ratio)
-            df['vol_ma_20'] = df['volume'].rolling(window=20).mean()
-            df['vol_surge_ratio'] = df['volume'] / df['vol_ma_20']
-
-            # 3. Indikator Klasik (RSI 14 & MACD 12, 26)
-            delta = df['close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
-
-            exp1 = df['close'].ewm(span=12, adjust=False).mean()
-            exp2 = df['close'].ewm(span=26, adjust=False).mean()
-            df['MACD'] = exp1 - exp2
-
-            # 4. Ambil baris terakhir dan validasi NaN (tanpa dropna seluruh df)
-            baris_terbaru = df[fitur_wajib].iloc[-1:]
-            if baris_terbaru.isnull().any(axis=1).iloc[0]:
-                return {"action": "hold", "reason": "Data tidak cukup setelah perhitungan indikator"}
-
-            _feat_cache["key"] = _cache_key
-            _feat_cache["baris_terbaru"] = baris_terbaru
-
-        # 5. Transformasi Data dengan Scaler dan Prediksi Model
-        # NEW-03 FIX: Cek ML_ENABLED sebelum akses scaler/model.
-        # Tanpa guard ini, jika .pkl tidak ada (ML disabled), setiap tick masuk except
-        # → bot_monitor consecutive_errors naik terus → dashboard selalu merah "ERROR"
-        # padahal bot berjalan normal dalam pure-indicator mode.
-        if not ML_ENABLED:
-            return {"action": "hold", "reason": "ML tidak aktif (file .pkl tidak ditemukan), gunakan pure indicator mode"}
-
-        data_scaled = scaler.transform(baris_terbaru)
-        proba: np.ndarray = model.predict_proba(data_scaled)[0]  # [prob_turun, prob_naik]
-        probabilitas_naik: float  = float(proba[1])
-        probabilitas_turun: float = float(proba[0])  # BUG-04 FIX: tambah probabilitas turun untuk sinyal short
-
-        # 6. Evaluasi Trigger Entry
-        if probabilitas_naik > 0.60:
-            bot_state["in_position"] = True
-            bot_state["side"]        = "long"   # BUG-04 FIX: simpan side
-            bot_state["entry_price"] = current_ask  # Catat harga saat beli
-            bot_state["entry_time"]  = current_time  # Catat waktu untuk Time Stop
-            return {
-                "action": "buy",
-                "reason": f"Sinyal RF ML Prob Naik > 60% (Skor: {probabilitas_naik:.2f})"
-            }
-
-        # BUG-04 FIX: Sinyal SELL/SHORT saat probabilitas turun > 60%
-        if probabilitas_turun > 0.60:
-            bot_state["in_position"] = True
-            bot_state["side"]        = "short"  # simpan side short
-            bot_state["entry_price"] = current_bid  # Catat harga saat jual
-            bot_state["entry_time"]  = current_time
-            return {
-                "action": "sell",
-                "reason": f"Sinyal RF ML Prob Turun > 60% (Skor: {probabilitas_turun:.2f})"
-            }
-
-    except Exception as e:
-        return {"action": "hold", "reason": f"Error Eksekusi ML: {str(e)}"}
-
-    return {"action": "hold", "reason": "Tidak ada sinyal, probabilitas <= 60%"}
+    return val_now, val_prev, sqzOn, sqzOff, noSqz
 
 
 # =============================================================================
-# ON_TICK — Entry point yang dipanggil main.py setiap candle/tick baru
+# 1. GENERATE SIGNAL
 # =============================================================================
-def on_tick(data: MarketDataSnapshot) -> None:
+def generate_signal(data: dict) -> dict:
     """
-    Dipanggil oleh main.py setiap ada candle baru (KLINE mode) atau tick baru (TICK mode).
-    Menghasilkan sinyal dari generate_signal() lalu meneruskan ke execution.place_order().
-    Juga melaporkan metrik ke bot_monitor untuk health tracking.
+    Analyse market data using Squeeze Momentum logic and return a trading signal.
+
+    Long  → val crossover  0 (momentum berubah positif)
+    Short → val crossunder 0 (momentum berubah negatif)
     """
-    import execution   # import di sini untuk hindari circular dependency
+    # --- Guard: tidak boleh trading selama preload historis ---
+    if data.get("is_warmup", False):
+        return {"action": "hold", "reason": "Warmup — historical candles loading, no trade allowed"}
+
+    candles = data.get("candles", {}).get(TF, [])
+    current = data.get("current", {}).get(TF)
+    best_bid = data.get("best_bid", {})
+    best_ask = data.get("best_ask", {})
+    spread   = data.get("bid_ask_spread", 0.0)
+    funding  = data.get("funding_rate", 0.0)
+
+    # --- Guard: butuh cukup candle ---
+    if len(candles) < MIN_CANDLES or current is None:
+        return {"action": "hold", "reason": f"Not enough {TF} candles ({len(candles)}/{MIN_CANDLES})"}
+
+    # --- Sertakan live candle dalam kalkulasi (sama seperti TradingView) ---
+    # val dihitung termasuk harga live saat ini sehingga sinyal muncul
+    # di bar yang sedang berjalan, bukan menunggu bar tutup (delay max 2h).
+    calc_candles = candles + [current]
+
+    # --- Guard: spread terlalu lebar ---
+    if spread > MAX_SPREAD_USDT:
+        return {"action": "hold", "reason": f"Spread too wide: {spread:.6f}"}
+
+    bid_price = best_bid.get("price", 0.0)
+    ask_price = best_ask.get("price", 0.0)
+
+    # --- Hitung Squeeze Momentum ---
+    result = _compute_sqzmom(calc_candles)
+    if result is None:
+        return {"action": "hold", "reason": "Insufficient data for SQZ MOM"}
+
+    val_now, val_prev, sqzOn, sqzOff, noSqz = result
+
+    # ---------- Tentukan state label (untuk logging) ----------
+    if sqzOn:
+        sqz_label = "SQZ_ON"
+    elif sqzOff:
+        sqz_label = "SQZ_OFF"
+    else:
+        sqz_label = "NO_SQZ"
+
+    logger.debug(
+        f"[SQZ MOM] val={val_now:.6f}  prev={val_prev:.6f}  state={sqz_label}"
+    )
+
+    # --- Kelola posisi terbuka terlebih dahulu ---
+    position = get_position()
+
+    if position["side"] == "long":
+        entry = position["entry_price"]
+        if bid_price >= entry * (1 + TAKE_PROFIT_PCT):
+            return {"action": "close", "reason": f"Take profit (long) | val={val_now:.5f}"}
+        if bid_price <= entry * (1 - STOP_LOSS_PCT):
+            return {"action": "close", "reason": f"Stop loss (long) | val={val_now:.5f}"}
+        # Exit tambahan: momentum berbalik negatif (crossunder 0)
+        if val_now < 0 and val_prev >= 0:
+            return {"action": "close", "reason": f"Momentum crossunder 0 — exit long | val={val_now:.5f}"}
+        return {"action": "hold", "reason": f"Holding long | {sqz_label} | val={val_now:.5f}"}
+
+    if position["side"] == "short":
+        entry = position["entry_price"]
+        if ask_price <= entry * (1 - TAKE_PROFIT_PCT):
+            return {"action": "close", "reason": f"Take profit (short) | val={val_now:.5f}"}
+        if ask_price >= entry * (1 + STOP_LOSS_PCT):
+            return {"action": "close", "reason": f"Stop loss (short) | val={val_now:.5f}"}
+        # Exit tambahan: momentum berbalik positif (crossover 0)
+        if val_now > 0 and val_prev <= 0:
+            return {"action": "close", "reason": f"Momentum crossover 0 — exit short | val={val_now:.5f}"}
+        return {"action": "hold", "reason": f"Holding short | {sqz_label} | val={val_now:.5f}"}
+
+    # --- Tidak ada posisi: cari sinyal entry ---
+
+    # LONG: val crossover 0 (dari negatif/nol ke positif)
+    if val_now > 0 and val_prev <= 0:
+        if funding > 0.001:
+            return {"action": "hold", "reason": f"Funding rate terlalu tinggi untuk long: {funding:.6f}"}
+        return {
+            "action": "buy",
+            "reason": f"SQZ MOM crossover 0 → LONG | {sqz_label} | val={val_now:.5f}"
+        }
+
+    # SHORT: val crossunder 0 (dari positif/nol ke negatif)
+    if val_now < 0 and val_prev >= 0:
+        if funding < -0.001:
+            return {"action": "hold", "reason": f"Funding rate menghukum short: {funding:.6f}"}
+        return {
+            "action": "sell",
+            "reason": f"SQZ MOM crossunder 0 → SHORT | {sqz_label} | val={val_now:.5f}"
+        }
+
+    return {"action": "hold", "reason": f"No crossover | {sqz_label} | val={val_now:.5f}"}
+
+
+# =============================================================================
+# 2. EXECUTE TRADE
+# =============================================================================
+def execute_trade(signal: dict):
+    """
+    Forward signal ke execution layer.
+    Jangan tambahkan API call langsung di sini — gunakan place_order saja.
+    """
+    if signal.get("action") in ("buy", "sell", "close"):
+        logger.info(f"[EXECUTE] {signal['action'].upper()} | {signal.get('reason', '')}")
+        place_order(signal)
+
+
+# =============================================================================
+# 3. MANAGE POSITION (dipanggil setiap tick)
+# =============================================================================
+def manage_position(data: dict):
+    """
+    Dipanggil setiap tick. Digunakan untuk trailing stop, scaling, dll.
+    Saat ini tidak dipakai — logika exit sudah ada di generate_signal.
+    """
+    pass  # Extend as needed
+
+
+# =============================================================================
+# MAIN STRATEGY LOOP (dipanggil oleh main.py setiap tick)
+# =============================================================================
+def on_tick(data: dict):
+    """
+    Entry point yang dipanggil main.py setiap tick.
+    1. Generate signal
+    2. Execute jika actionable
+    3. Kelola posisi terbuka
+    """
+    signal = generate_signal(data)
+    if signal.get("action") in ("buy", "sell", "close"):
+        logger.info(f"[EXECUTE] {signal['action'].upper()} | {signal.get('reason', '')}")
+        place_order(signal)
+    manage_position(data)
+
     import bot_monitor
-
-    # --- Sinkronisasi Memori (Mencegah Amnesia Posisi setelah Restart) ---
-    try:
-        import position_manager as _pm
-        _pos: dict[str, object] = _pm.get_position()
-        _pos_side: str    = str(_pos.get("side", "none"))
-        _entry_price: float = float(_pos.get("entry_price", 0.0))  # type: ignore[arg-type]
-
-        global bot_state
-        if _pos_side in ("long", "short"):
-            bot_state["in_position"] = True
-            bot_state["side"] = _pos_side  # BUG-04 FIX: sync side dari position_manager
-            if _entry_price > 0:
-                bot_state["entry_price"] = _entry_price
-            # Fix 3: Pulihkan entry_time jika hilang setelah restart
-            # Tanpa ini, Time Stop tidak akan pernah terpicu setelah bot restart.
-            if bot_state.get("entry_time", 0) == 0:
-                _open_time: Optional[float] = _pos.get("open_time")  # type: ignore[assignment]
-                if _open_time:
-                    bot_state["entry_time"] = _open_time
-        else:
-            bot_state["in_position"] = False
-            bot_state["side"] = "none"  # BUG-04 FIX: reset side juga
-            bot_state["entry_time"] = 0.0  # reset agar Time Stop tidak terpicu palsu
-    except Exception:
-        pass
-    # ---------------------------------------------------------------------
-
-    signal: Signal
-    try:
-        signal = generate_signal(data)
-    except Exception as e:
-        err_reason: str = f"generate_signal() crash: {type(e).__name__}: {e}"
-        bot_monitor.record_error(err_reason)
-        return
-
-    # Ambil probabilitas ML terakhir jika tersedia (untuk health tracking)
-    _prob: Optional[float] = None
-    reason: str = signal.get("reason", "")
-    if "Skor:" in reason:
-        try:
-            _prob = float(reason.split("Skor:")[1].split(")")[0].strip())
-        except Exception:
-            pass
-
-    # Ambil equity & position_side dari position_manager untuk deteksi anomali
-    _equity: Optional[float]
-    _pos_side_mon: Optional[str]
-    try:
-        import position_manager as _pm
-        _pnl_summary = _pm.get_pnl_summary()
-        _equity       = float(_pnl_summary.get("equity", 0.0))  # type: ignore[arg-type]
-        _pos_side_mon = str(_pnl_summary.get("side", "none"))
-    except Exception:
-        _equity       = None
-        _pos_side_mon = None
-
-    # Laporkan ke health tracker (sertakan data mentah untuk cek kualitas)
-    bot_monitor.record_tick(signal, ml_prob=_prob, data=data,  # type: ignore[arg-type]
-                            equity=_equity, position_side=_pos_side_mon)
-
-    # Teruskan ke execution jika ada aksi nyata
-    action: str = signal.get("action", "hold")
-    if action != "hold":
-        execution.place_order(signal)
+    bot_monitor.record_tick(signal, data=data)

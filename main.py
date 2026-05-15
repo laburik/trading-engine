@@ -134,18 +134,26 @@ async def strategy_loop() -> None:
             await asyncio.sleep(0)
 
     else:
-        # ---- KLINE MODE: trigger saat buffer berubah ATAU candle live update ----
-        # BUG-06 FIX: Sebelumnya hanya trigger saat candle_buffers bertambah (candle tutup).
-        # Sekarang juga trigger saat _current_candle (live candle) berubah.
-        # Ini memastikan strategy.on_tick() dipanggil setiap ada data baru dari Bybit,
-        # bukan hanya setiap 15 menit (di timeframe 15m) saat candle confirm.
-        last_total: int = 0
-        last_current_hash: int = 0
+        # ---- KLINE MODE: trigger saat candle baru tutup ATAU live candle berubah ----
+        # BUG-07 FIX: total=sum(len(buf)) tidak berubah saat buffer maxlen tercapai
+        # (deque buang yang lama, panjang tetap). Ganti ke tracking open_time candle
+        # terakhir per TF agar trigger tetap aktif setelah preload penuh.
+        _last_closed_times: dict[str, float] = {
+            tf: (buf[-1]["open_time"] if buf else 0.0)
+            for tf, buf in active_data.candle_buffers.items()
+        }
+        last_current_hash: int = -1  # -1 agar iterasi pertama selalu trigger
         while True:
-            total: int = sum(len(buf) for buf in active_data.candle_buffers.values())
+            # Deteksi candle baru tutup: cek open_time candle terakhir per TF
+            new_candle_closed = False
+            for tf, buf in active_data.candle_buffers.items():
+                if buf:
+                    t: float = buf[-1]["open_time"]
+                    if t != _last_closed_times.get(tf, 0.0):
+                        _last_closed_times[tf] = t
+                        new_candle_closed = True
 
-            # Hitung hash sederhana dari open_time semua current candle
-            # untuk mendeteksi apakah ada live candle yang berubah
+            # Deteksi live candle berubah (update harga intra-candle)
             current_hash: int = hash(tuple(
                 (tf, c["open_time"] if c else 0, round(c["close"], 8) if c else 0)
                 for tf, c in active_data._current_candle.items()
@@ -157,8 +165,7 @@ async def strategy_loop() -> None:
             if bid > 0 and ask > 0:
                 position_manager.update_pnl(bid, ask)
 
-            if total != last_total or current_hash != last_current_hash:
-                last_total = total
+            if new_candle_closed or current_hash != last_current_hash:
                 last_current_hash = current_hash
                 live_data_kline: MarketDataSnapshot = active_data.get_live_data()  # type: ignore[assignment]
                 try:
