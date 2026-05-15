@@ -88,7 +88,7 @@ _state = {
 
     # ML tracking
     "last_ml_prob":         None,
-    "ml_prob_history":      deque(maxlen=20),   # rolling 20 nilai terakhir
+    "ml_prob_history":      deque(maxlen=30),   # rolling 30 nilai terakhir (match ML_DRIFT_MIN_SAMPLES)
 
     # Status
     "status":               "STARTING",

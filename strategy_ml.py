@@ -91,8 +91,8 @@ def generate_signal(data: MarketDataSnapshot) -> Signal:
                 break
 
     candles_list: list[object] = candles_tf.get("list", [])  # type: ignore[assignment]
-    if len(candles_list) < 50:
-        return {"action": "hold", "reason": f"Menunggu buffer candle mencapai 50 (sekarang {len(candles_list)})"}
+    if len(candles_list) < MIN_CANDLES:
+        return {"action": "hold", "reason": f"Menunggu buffer candle mencapai {MIN_CANDLES} (sekarang {len(candles_list)})"}
 
     # Konversi ke Pandas DataFrame
     df: pd.DataFrame = pd.DataFrame(candles_list)

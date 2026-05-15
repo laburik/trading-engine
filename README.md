@@ -71,7 +71,18 @@ TIMEFRAMES = {
 }
 ```
 
-### 3. Validasi strategy.py (opsional tapi sangat disarankan)
+### 3. Jalankan test suite (opsional, sangat cepat — ~2 detik)
+
+```bash
+pip install pytest pytest-cov pytest-asyncio   # sekali install saja
+python -m pytest                               # 65 test, ~2 detik
+python -m pytest --cov                         # plus coverage report
+```
+
+Test cover: **PnL math, signal generation, engine orchestration, monitoring**.
+Berguna setelah refactor untuk pastikan tidak ada regresi.
+
+### 4. Validasi strategy.py (opsional tapi sangat disarankan)
 
 ```bash
 python preflight_check.py
@@ -316,6 +327,8 @@ bot/
 ├── data_resampler.py     ← Tick → candle realtime (aktif jika DATA_MODE="tick")
 ├── strategy.py           ←  USER EDIT DI SINI (cukup tulis generate_signal)
 ├── strategy_runtime.py   ←  Engine orkestrator (signal → record → execute)
+├── tests/                ←  pytest suite (65 test, coverage 72%) — `python -m pytest`
+├── pytest.ini            ←  Konfigurasi pytest
 ├── strategy_sqz_backup.py← Backup strategi Squeeze Momentum asli
 ├── strategy_ml.py        ←  Variant ML (Random Forest + Triple Barrier) — referensi mode advanced
 ├── execution.py          ← Order execution (paper / live)

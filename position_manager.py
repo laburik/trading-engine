@@ -154,7 +154,7 @@ def update_pnl(bid_price: float, ask_price: float) -> None:
 
     _state["equity"] = _state["balance"] + _state["unrealized_pnl"]
 
-    # --- PENCEGAHAN SPAM MEMORY (CETAK MAKS 1 KALI PER DETIK) ---
+    # --- PENCEGAHAN SPAM MEMORY (CETAK MAKS 1 KALI PER MENIT) ---
     now: float = time.time()
     if now - _last_equity_log_time >= 60.0:
         equity_row: EquityLogRow = {

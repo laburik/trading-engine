@@ -17,6 +17,11 @@ sortedcontainers>=2.4.0 # Optimized dictionary operations
 streamlit-autorefresh==1.0.1  # Automatic dashboard refresh
 
 
+# === Testing (opsional — hanya untuk dev) ===
+pytest>=8.0.0          # Test runner
+pytest-cov>=4.1.0      # Coverage reporting
+pytest-asyncio>=0.23.0 # Test async functions
+
 # === Standard library (no install needed) ===
 # asyncio, json, csv, os, time, threading, queue, collections, logging, ssl
 # (hmac, hashlib, uuid sudah tidak dipakai — digantikan CCXT)
