@@ -38,7 +38,7 @@ MODE = "paper"
 # --- Account ---
 INITIAL_BALANCE = 1000.0       # Paper trading starting balance (USDT)
 LEVERAGE = 10                  # Leverage multiplier
-ORDER_SIZE_USDT = 50.0         # Size per trade in USDT (before leverage)
+ORDER_SIZE_USDT = 5         # Size per trade in USDT (before leverage)
 
 # --- Execution ---
 SLIPPAGE_TOLERANCE = 0.0005    # 0.05% max slippage tolerance

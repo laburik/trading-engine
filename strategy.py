@@ -68,6 +68,9 @@ bot_state: BotState = {
 # Minimum candle warmup sebelum strategi mulai
 MIN_CANDLES: int = 50
 
+# Cache feature engineering — skip recompute jika candle belum berubah
+_feat_cache: dict = {"key": None, "baris_terbaru": None}
+
 # ==========================================
 # 3. LOGIKA UTAMA BOT
 # ==========================================
@@ -166,39 +169,47 @@ def generate_signal(data: MarketDataSnapshot) -> Signal:
     # B. LOGIKA MASUK (ENTRY: MACHINE LEARNING & FEATURE ENGINEERING)
     # ---------------------------------------------------------
     try:
-        # 1. Fitur Pergerakan & Lag
-        df['return'] = df['close'].pct_change()
-        for i in [1, 3, 5]:
-            df[f'return_lag_{i}'] = df['return'].shift(i)
-            df[f'volume_lag_{i}'] = df['volume'].shift(i)
-
-        # 2. Fitur Momentum Volume (Surge Ratio)
-        df['vol_ma_20'] = df['volume'].rolling(window=20).mean()
-        df['vol_surge_ratio'] = df['volume'] / df['vol_ma_20']
-
-        # 3. Indikator Klasik (RSI 14 & MACD 12, 26)
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
-
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = exp1 - exp2
-
-        # 4. Filter Kolom dan Pembersihan NaN
-        df.dropna(inplace=True)
-        if len(df) == 0:
-            return {"action": "hold", "reason": "Data tidak cukup setelah perhitungan indikator"}
-
         fitur_wajib: list[str] = [
             'volume', 'return', 'return_lag_1', 'volume_lag_1',
             'return_lag_3', 'volume_lag_3', 'return_lag_5', 'volume_lag_5',
             'vol_ma_20', 'vol_surge_ratio', 'RSI_14', 'MACD'
         ]
 
-        # Ambil baris terakhir saja (candle terbaru yang telah selesai terbentuk)
-        baris_terbaru: pd.DataFrame = df[fitur_wajib].iloc[-1:]
+        # Cache key: (jumlah candle, open_time candle terakhir)
+        # Jika candle belum berubah sejak tick lalu, skip seluruh feature engineering
+        _last_open_time = candles_list[-1].get("open_time", 0) if isinstance(candles_list[-1], dict) else 0
+        _cache_key = (len(candles_list), _last_open_time)
+
+        if _feat_cache["key"] == _cache_key and _feat_cache["baris_terbaru"] is not None:
+            baris_terbaru: pd.DataFrame = _feat_cache["baris_terbaru"]
+        else:
+            # 1. Fitur Pergerakan & Lag
+            df['return'] = df['close'].pct_change()
+            for i in [1, 3, 5]:
+                df[f'return_lag_{i}'] = df['return'].shift(i)
+                df[f'volume_lag_{i}'] = df['volume'].shift(i)
+
+            # 2. Fitur Momentum Volume (Surge Ratio)
+            df['vol_ma_20'] = df['volume'].rolling(window=20).mean()
+            df['vol_surge_ratio'] = df['volume'] / df['vol_ma_20']
+
+            # 3. Indikator Klasik (RSI 14 & MACD 12, 26)
+            delta = df['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            df['RSI_14'] = 100 - (100 / (1 + (gain / loss)))
+
+            exp1 = df['close'].ewm(span=12, adjust=False).mean()
+            exp2 = df['close'].ewm(span=26, adjust=False).mean()
+            df['MACD'] = exp1 - exp2
+
+            # 4. Ambil baris terakhir dan validasi NaN (tanpa dropna seluruh df)
+            baris_terbaru = df[fitur_wajib].iloc[-1:]
+            if baris_terbaru.isnull().any(axis=1).iloc[0]:
+                return {"action": "hold", "reason": "Data tidak cukup setelah perhitungan indikator"}
+
+            _feat_cache["key"] = _cache_key
+            _feat_cache["baris_terbaru"] = baris_terbaru
 
         # 5. Transformasi Data dengan Scaler dan Prediksi Model
         # NEW-03 FIX: Cek ML_ENABLED sebelum akses scaler/model.
