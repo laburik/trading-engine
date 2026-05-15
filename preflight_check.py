@@ -242,23 +242,11 @@ def validate_strategy() -> tuple[list[str], list[str]]:
         return errors
 
     # ------------------------------------------------------------------
-    # LANGKAH 7: Pastikan fungsi on_tick() ADA
-    # main.py memanggil strategy.on_tick(data) setiap tick — bukan
-    # generate_signal(). Jika on_tick() tidak ada, bot crash seketika.
+    # LANGKAH 7: on_tick() OPSIONAL (mode advanced)
+    # Sejak refactor strategy_runtime, engine otomatis orkestrasi:
+    # generate_signal → record_tick → place_order. User tidak wajib
+    # nulis on_tick(). Jika ada, dianggap mode advanced (override engine).
     # ------------------------------------------------------------------
-    if not hasattr(strat, "on_tick") or not callable(getattr(strat, "on_tick")):
-        errors.append(
-            "[STRATEGY] ❌ Fungsi 'on_tick(data)' tidak ditemukan di strategy.py.\n"
-            "   main.py memanggil strategy.on_tick() setiap tick —\n"
-            "   tanpa fungsi ini bot akan crash langsung saat pertama kali jalan.\n"
-            "   Tambahkan minimal:\n"
-            "   def on_tick(data: dict):\n"
-            "       import execution\n"
-            "       signal = generate_signal(data)\n"
-            "       if signal['action'] != 'hold':\n"
-            "           execution.place_order(signal)"
-        )
-        return errors
 
     # ------------------------------------------------------------------
     # LANGKAH 8: generate_signal() HARUS return "hold" saat is_warmup=True
@@ -345,27 +333,28 @@ def validate_strategy() -> tuple[list[str], list[str]]:
         return errors, warnings
 
     # ------------------------------------------------------------------
-    # LANGKAH 11: on_tick() HARUS merujuk ke execution.place_order()
-    # Jika on_tick() tidak pernah memanggil place_order(), sinyal yang
-    # dihasilkan AI tidak akan pernah diteruskan ke Bybit → bot tidak
-    # akan pernah trading meskipun semua log terlihat normal.
+    # LANGKAH 11: Jika user define on_tick() (mode advanced), pastikan
+    # tetap merujuk ke execution.place_order(). Mode default tidak butuh
+    # cek ini karena strategy_runtime yang panggil place_order otomatis.
     # ------------------------------------------------------------------
     import inspect
-    try:
-        on_tick_src = inspect.getsource(strat.on_tick)
-        has_execution = "execution" in on_tick_src or "place_order" in on_tick_src
-        if not has_execution:
-            errors.append(
-                "[STRATEGY] ❌ on_tick() tidak memanggil 'execution.place_order()'.\n"
-                "   Sinyal dari generate_signal() tidak akan pernah dikirim ke Bybit.\n"
-                "   Bot akan jalan dan menghasilkan sinyal, tapi TIDAK ADA order\n"
-                "   yang benar-benar dieksekusi — tidak ada trading terjadi.\n"
-                "   Pastikan on_tick() berisi:\n"
-                "   if signal['action'] != 'hold':\n"
-                "       execution.place_order(signal)"
-            )
-    except (OSError, TypeError):
-        pass  # source tidak bisa dibaca → lewati cek ini
+    if hasattr(strat, "on_tick") and callable(getattr(strat, "on_tick")):
+        try:
+            on_tick_src = inspect.getsource(strat.on_tick)
+            has_execution = "execution" in on_tick_src or "place_order" in on_tick_src
+            if not has_execution:
+                errors.append(
+                    "[STRATEGY] ❌ on_tick() didefinisikan tapi tidak memanggil "
+                    "'execution.place_order()'.\n"
+                    "   Karena Anda override on_tick (mode advanced), engine TIDAK\n"
+                    "   akan auto-execute — Anda harus panggil place_order() sendiri.\n"
+                    "   Solusi: hapus on_tick() (engine handle otomatis), ATAU\n"
+                    "   tambahkan di on_tick:\n"
+                    "       if signal['action'] != 'hold':\n"
+                    "           execution.place_order(signal)"
+                )
+        except (OSError, TypeError):
+            pass  # source tidak bisa dibaca → lewati cek ini
 
     # ------------------------------------------------------------------
     # LANGKAH 12-15: Analisis AST — deteksi pola berbahaya di strategy.py

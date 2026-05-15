@@ -144,8 +144,9 @@ Strategi bebas menggunakan **Machine Learning** atau **indikator teknikal biasa*
 
 | Fungsi | Deskripsi |
 |---|---|
-| `generate_signal(data)` | Analisa data dan return sinyal trading |
-| `on_tick(data)` | Entry point — dipanggil setiap candle baru oleh `main.py` |
+| `generate_signal(data)` | **SATU-SATUNYA fungsi yang wajib.** Analisa data dan return sinyal. |
+
+> 🎉 **Sejak refactor strategy_runtime:** Anda **TIDAK PERLU** menulis `on_tick()`, `execute_trade()`, atau `manage_position()`. Engine otomatis panggil `generate_signal()` setiap tick → catat ke dashboard → forward ke `execution.place_order()` jika action ≠ hold.
 
 ### Format return — WAJIB
 
@@ -157,7 +158,7 @@ Strategi bebas menggunakan **Machine Learning** atau **indikator teknikal biasa*
 > **Pre-flight check** akan menjalankan `generate_signal()` dengan data dummy saat startup.
 > Jika return formatnya salah atau ada error, bot tidak akan jalan dan tampilkan pesan error.
 
-### Contoh strategy tanpa ML (pure indicator)
+### Contoh strategi minimal (cukup 1 fungsi!)
 
 ```python
 def generate_signal(data):
@@ -172,13 +173,21 @@ def generate_signal(data):
     if sma_fast > sma_slow:
         return {"action": "buy", "reason": "SMA5 cross above SMA20"}
     return {"action": "hold", "reason": "Tidak ada sinyal"}
+```
 
+Itu saja. Tidak perlu import `execution`, `bot_monitor`, atau menulis `on_tick`. Engine handle semuanya.
+
+### Mode advanced (opsional): override `on_tick()`
+
+Hanya kalau Anda butuh kontrol penuh — misal sync state custom dengan position_manager seperti di `strategy_ml.py` (Random Forest + Triple Barrier). Jika `on_tick()` didefinisikan, engine bypass orkestrasi default dan serahkan eksekusi ke Anda. Lihat `strategy_ml.py` sebagai referensi.
+
+```python
 def on_tick(data):
     import execution, bot_monitor
     signal = generate_signal(data)
+    bot_monitor.record_tick(signal, data=data)   # WAJIB di mode advanced
     if signal["action"] != "hold":
         execution.place_order(signal)
-    bot_monitor.record_tick(signal, data=data)   # WAJIB — tanpa ini dashboard stuck di STARTING
 ```
 
 ### Data tersedia di `data` dict
@@ -305,8 +314,10 @@ bot/
 ├── data_stream.py        ← WebSocket orderbook + funding rate + heartbeat
 ├── candle_stream.py      ← Bybit Kline WebSocket (aktif jika DATA_MODE="kline")
 ├── data_resampler.py     ← Tick → candle realtime (aktif jika DATA_MODE="tick")
-├── strategy.py           ←  USER EDIT DI SINI (ML atau pure indicator)
+├── strategy.py           ←  USER EDIT DI SINI (cukup tulis generate_signal)
+├── strategy_runtime.py   ←  Engine orkestrator (signal → record → execute)
 ├── strategy_sqz_backup.py← Backup strategi Squeeze Momentum asli
+├── strategy_ml.py        ←  Variant ML (Random Forest + Triple Barrier) — referensi mode advanced
 ├── execution.py          ← Order execution (paper / live)
 ├── position_manager.py   ← PnL tracking
 ├── bot_monitor.py        ←  Health monitor: watchdog, error rate, data quality

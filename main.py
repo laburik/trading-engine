@@ -33,6 +33,7 @@ from ft_types import MarketDataSnapshot
 import data_stream
 import position_manager
 import strategy
+import strategy_runtime
 
 # --- Import modul data sesuai mode ---
 # We use an untyped alias; mypy ignores the conditional re-import via type: ignore.
@@ -127,7 +128,7 @@ async def strategy_loop() -> None:
 
             live_data: MarketDataSnapshot = active_data.get_live_data()  # type: ignore[assignment]
             try:
-                strategy.on_tick(live_data)
+                strategy_runtime.run_iteration(strategy, live_data)
             except Exception as e:
                 logger.error(f"Strategy error: {e}", exc_info=True)
 
@@ -169,7 +170,7 @@ async def strategy_loop() -> None:
                 last_current_hash = current_hash
                 live_data_kline: MarketDataSnapshot = active_data.get_live_data()  # type: ignore[assignment]
                 try:
-                    strategy.on_tick(live_data_kline)
+                    strategy_runtime.run_iteration(strategy, live_data_kline)
                 except Exception as e:
                     logger.error(f"Strategy error: {e}", exc_info=True)
 

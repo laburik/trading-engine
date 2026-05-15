@@ -38,8 +38,7 @@
 
 import logging
 import numpy as np
-from execution import place_order
-from position_manager import get_position, get_pnl_summary
+from position_manager import get_position
 
 logger = logging.getLogger("strategy")
 
@@ -270,44 +269,9 @@ def generate_signal(data: dict) -> dict:
 
 
 # =============================================================================
-# 2. EXECUTE TRADE
+# Catatan: TIDAK perlu nulis on_tick(), execute_trade(), atau manage_position().
+# Engine (strategy_runtime.py) otomatis:
+#   - panggil generate_signal(data) tiap tick
+#   - catat ke bot_monitor.record_tick() untuk dashboard
+#   - forward ke execution.place_order() jika action != "hold"
 # =============================================================================
-def execute_trade(signal: dict):
-    """
-    Forward signal ke execution layer.
-    Jangan tambahkan API call langsung di sini — gunakan place_order saja.
-    """
-    if signal.get("action") in ("buy", "sell", "close"):
-        logger.info(f"[EXECUTE] {signal['action'].upper()} | {signal.get('reason', '')}")
-        place_order(signal)
-
-
-# =============================================================================
-# 3. MANAGE POSITION (dipanggil setiap tick)
-# =============================================================================
-def manage_position(data: dict):
-    """
-    Dipanggil setiap tick. Digunakan untuk trailing stop, scaling, dll.
-    Saat ini tidak dipakai — logika exit sudah ada di generate_signal.
-    """
-    pass  # Extend as needed
-
-
-# =============================================================================
-# MAIN STRATEGY LOOP (dipanggil oleh main.py setiap tick)
-# =============================================================================
-def on_tick(data: dict):
-    """
-    Entry point yang dipanggil main.py setiap tick.
-    1. Generate signal
-    2. Execute jika actionable
-    3. Kelola posisi terbuka
-    """
-    signal = generate_signal(data)
-    if signal.get("action") in ("buy", "sell", "close"):
-        logger.info(f"[EXECUTE] {signal['action'].upper()} | {signal.get('reason', '')}")
-        place_order(signal)
-    manage_position(data)
-
-    import bot_monitor
-    bot_monitor.record_tick(signal, data=data)
