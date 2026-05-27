@@ -13,10 +13,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# Pastikan project root ada di sys.path supaya `import strategy` dst jalan
+# Pastikan project root ada di sys.path supaya `import strategy` dst jalan,
+# dan engine/ supaya `import position_manager` dst (modul infra) juga jalan.
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+_ENGINE = os.path.join(_ROOT, "engine")
+for _p in (_ROOT, _ENGINE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 # =============================================================================

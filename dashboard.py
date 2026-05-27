@@ -7,10 +7,14 @@
 # if you copy, haram, unless you ask permission from the author
 # for personal use only, if you use it for commercial purposes, you will be responsible for your own actions
 
-import time
-import json
 import os
 import sys
+
+# Tambahkan folder engine/ ke sys.path agar modul infrastruktur bisa di-import flat.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine"))
+
+import time
+import json
 import pandas as pd
 import streamlit as st
 
@@ -44,7 +48,7 @@ def _file_signature(folder: str, filename: str) -> float:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_trade_history(path: str, _mtime: float) -> pd.DataFrame:
-    file = os.path.join(path, "trade_history.csv")
+    file = os.path.join(path, "logs", "trade_history.csv")
     if not os.path.exists(file):
         return pd.DataFrame()
     try:
@@ -60,7 +64,7 @@ def load_trade_history(path: str, _mtime: float) -> pd.DataFrame:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_equity_curve(path: str, _mtime: float) -> pd.DataFrame:
-    file = os.path.join(path, "equity_curve.csv")
+    file = os.path.join(path, "logs", "equity_curve.csv")
     if not os.path.exists(file):
         return pd.DataFrame()
     try:
@@ -88,7 +92,7 @@ def resample_equity(path: str, _mtime: float) -> pd.DataFrame:
 
 @st.cache_data(ttl=5)
 def read_heartbeat(path: str) -> dict:
-    file = os.path.join(path, "heartbeat.json")
+    file = os.path.join(path, "logs", "heartbeat.json")
     try:
         if os.path.exists(file):
             with open(file, "r") as f:
@@ -104,7 +108,7 @@ def bot_is_online(heartbeat: dict) -> bool:
 @st.cache_data(ttl=5, show_spinner=False)
 def load_health(path: str) -> dict:
     """Baca bot_health.json dari folder bot."""
-    fpath = os.path.join(path, "bot_health.json")
+    fpath = os.path.join(path, "logs", "bot_health.json")
     try:
         if os.path.exists(fpath):
             with open(fpath, "r") as f:
@@ -136,7 +140,7 @@ for p in raw_paths.splitlines():
     p = p.strip()
     if not p: continue
     
-    if os.path.exists(os.path.join(p, "trade_history.csv")) or os.path.exists(os.path.join(p, "heartbeat.json")) or p == ".":
+    if os.path.exists(os.path.join(p, "logs", "trade_history.csv")) or os.path.exists(os.path.join(p, "logs", "heartbeat.json")) or p == ".":
         if p == ".":
             name = os.path.basename(os.path.abspath(".")) + " (Current)"
         else:
@@ -182,8 +186,8 @@ with tab_portfolio:
     total_pnl_now = 0.0
 
     for b_name, b_path in valid_bots.items():
-        eq_mtime = _file_signature(b_path, "equity_curve.csv")
-        tr_mtime = _file_signature(b_path, "trade_history.csv")
+        eq_mtime = _file_signature(b_path, os.path.join("logs", "equity_curve.csv"))
+        tr_mtime = _file_signature(b_path, os.path.join("logs", "trade_history.csv"))
         df_resampled = resample_equity(b_path, eq_mtime)
         if not df_resampled.empty:
             try:
@@ -230,8 +234,8 @@ with tab_single:
 
     heartbeat = read_heartbeat(active_path)
     online    = bot_is_online(heartbeat)
-    tr_mtime  = _file_signature(active_path, "trade_history.csv")
-    eq_mtime  = _file_signature(active_path, "equity_curve.csv")
+    tr_mtime  = _file_signature(active_path, os.path.join("logs", "trade_history.csv"))
+    eq_mtime  = _file_signature(active_path, os.path.join("logs", "equity_curve.csv"))
     trade_df  = load_trade_history(active_path, tr_mtime)
     equity_df = load_equity_curve(active_path, eq_mtime)
 

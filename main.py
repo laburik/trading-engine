@@ -13,10 +13,17 @@
 # =============================================================================
 from __future__ import annotations
 
+import os
+import sys
+
+# Tambahkan folder engine/ ke sys.path agar modul infrastruktur (execution,
+# data_stream, dll) bisa di-import flat dari root. Pemula tidak perlu paham
+# struktur package — cukup `from execution import ...` di mana pun.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine"))
+
 import asyncio
 import logging
 import signal as _signal
-import sys
 import time as _time
 
 # Force UTF-8 output on Windows terminals (prevents UnicodeEncodeError from emoji)
@@ -189,6 +196,81 @@ def _handle_signal(sig: int, frame: object) -> None:
 
 
 # =============================================================================
+# SUPERVISED TASK (auto-restart on crash)
+# =============================================================================
+# Konfigurasi supervisor — bisa diubah kalau perlu lebih ketat/longgar
+_SUPERVISOR_BACKOFF_INITIAL: float = 5.0    # detik delay restart pertama
+_SUPERVISOR_BACKOFF_MAX: float     = 60.0   # cap exponential backoff
+_SUPERVISOR_MAX_RESTARTS_PER_HOUR: int = 20  # circuit breaker — di atas ini, anggap rusak permanen
+_SUPERVISOR_HEALTHY_RUNTIME_SEC: float = 300.0  # task yang jalan > 5 menit reset backoff
+
+
+async def _supervised(name: str, coro_factory) -> None:
+    """
+    Jalankan coroutine task, auto-restart kalau crash.
+
+    - CancelledError → propagate (graceful shutdown)
+    - Exception lain → log + sleep dengan exponential backoff → restart
+    - Backoff reset ke initial kalau task berhasil run > HEALTHY_RUNTIME_SEC
+    - Circuit breaker: > MAX_RESTARTS_PER_HOUR dalam 1 jam → raise (bug permanen)
+
+    Args:
+        name: identifier task untuk logging
+        coro_factory: function (no-arg) yang return coroutine baru tiap call.
+                      Pakai factory bukan coroutine karena coroutine sekali pakai.
+    """
+    backoff: float = _SUPERVISOR_BACKOFF_INITIAL
+    restart_times: list[float] = []
+
+    while not _shutdown_event.is_set():
+        # Circuit breaker — purge restart events > 1 jam, hitung yang masih relevan
+        now: float = _time.time()
+        restart_times = [t for t in restart_times if now - t < 3600]
+        if len(restart_times) >= _SUPERVISOR_MAX_RESTARTS_PER_HOUR:
+            logger.critical(
+                f"[SUPERVISOR] {name}: hit max {_SUPERVISOR_MAX_RESTARTS_PER_HOUR} "
+                f"restarts/hour → circuit breaker tripped, stopping task permanently. "
+                f"Manual investigation required."
+            )
+            return  # stop trying — likely permanent bug
+
+        run_start: float = _time.time()
+        try:
+            await coro_factory()
+            # Coroutine selesai normal (tidak diharapkan untuk long-running tasks)
+            logger.info(f"[SUPERVISOR] {name}: completed normally, supervisor exiting.")
+            return
+
+        except asyncio.CancelledError:
+            logger.info(f"[SUPERVISOR] {name}: cancelled, propagating.")
+            raise
+
+        except Exception as e:
+            run_duration: float = _time.time() - run_start
+            restart_times.append(now)
+
+            # Reset backoff kalau task sempat jalan sehat sebelum crash
+            if run_duration > _SUPERVISOR_HEALTHY_RUNTIME_SEC:
+                backoff = _SUPERVISOR_BACKOFF_INITIAL
+                logger.info(f"[SUPERVISOR] {name}: backoff reset (ran healthy {run_duration:.0f}s)")
+
+            logger.error(
+                f"[SUPERVISOR] {name}: CRASHED with {type(e).__name__}: {e} "
+                f"(ran {run_duration:.1f}s) → restart #{len(restart_times)} in {backoff:.1f}s",
+                exc_info=True,
+            )
+
+            # Sleep dengan respect ke shutdown event (cancel awal kalau shutdown signal)
+            try:
+                await asyncio.wait_for(_shutdown_event.wait(), timeout=backoff)
+                return  # shutdown selama sleep — exit
+            except asyncio.TimeoutError:
+                pass  # normal timeout = lanjut restart
+
+            backoff = min(backoff * 2, _SUPERVISOR_BACKOFF_MAX)
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 async def main() -> None:
@@ -239,34 +321,60 @@ async def main() -> None:
         await position_manager.initial_sync()
         logger.info("Initial balance/position sync completed before strategy starts.")
 
-    # Susun task berdasarkan DATA_MODE
+    # Susun task berdasarkan DATA_MODE — masing-masing wrap dengan supervisor
+    # agar satu task crash tidak mematikan seluruh bot.
     tasks: list[asyncio.Task[None]] = [
-        asyncio.create_task(data_stream.start_data_stream(), name="data_stream"),
-        asyncio.create_task(strategy_loop(), name="strategy"),
+        asyncio.create_task(_supervised("data_stream", data_stream.start_data_stream), name="data_stream"),
+        asyncio.create_task(_supervised("strategy",    strategy_loop),                  name="strategy"),
     ]
 
     if DATA_MODE == "kline":
         import candle_stream
-        tasks.append(asyncio.create_task(candle_stream.start_candle_stream(), name="candle_stream"))
+        tasks.append(asyncio.create_task(
+            _supervised("candle_stream", candle_stream.start_candle_stream),
+            name="candle_stream",
+        ))
     else:
         import data_resampler
-        tasks.append(asyncio.create_task(data_resampler.start_resampler(), name="resampler"))
+        tasks.append(asyncio.create_task(
+            _supervised("resampler", data_resampler.start_resampler),
+            name="resampler",
+        ))
 
     if MODE in ("demo", "live"):
-        tasks.append(asyncio.create_task(position_manager.start_pnl_sync_loop(), name="pnl_sync"))
+        tasks.append(asyncio.create_task(
+            _supervised("pnl_sync", position_manager.start_pnl_sync_loop),
+            name="pnl_sync",
+        ))
 
+    # Tunggu shutdown event (atau semua task selesai). Karena tiap task sudah
+    # supervised, FIRST_EXCEPTION/FIRST_COMPLETED tidak dipakai — kita run forever.
+    shutdown_waiter: asyncio.Task[bool] = asyncio.create_task(
+        _shutdown_event.wait(), name="shutdown_waiter"
+    )
     try:
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        done, pending = await asyncio.wait(
+            tasks + [shutdown_waiter],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
         for t in done:
+            if t is shutdown_waiter:
+                logger.info("Shutdown event triggered — stopping all tasks.")
+                continue
             if t.exception():
-                logger.error(f"Task '{t.get_name()}' raised: {t.exception()}")
+                logger.error(f"Supervised task '{t.get_name()}' exited with: {t.exception()}")
+            else:
+                logger.warning(f"Supervised task '{t.get_name()}' exited normally (circuit breaker?).")
     except asyncio.CancelledError:
         pass
     finally:
         logger.info("Cancelling remaining tasks...")
+        _shutdown_event.set()  # signal semua _supervised loop untuk exit cleanly
         for t in tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if not shutdown_waiter.done():
+            shutdown_waiter.cancel()
+        await asyncio.gather(*tasks, shutdown_waiter, return_exceptions=True)
 
         from trade_logger import shutdown as logger_shutdown
         logger_shutdown()

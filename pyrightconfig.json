@@ -1,0 +1,13 @@
+{
+  "include": ["."],
+  "exclude": ["**/__pycache__", ".git", "data", "logs", "models"],
+  "extraPaths": ["./engine"],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["./engine"]
+    }
+  ],
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": "none"
+}

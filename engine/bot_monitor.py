@@ -25,7 +25,7 @@ from collections import deque
 # ─────────────────────────────────────────────────────────────────────────────
 # KONFIGURASI
 # ─────────────────────────────────────────────────────────────────────────────
-HEALTH_FILE               = "bot_health.json"  # file output yang dibaca dashboard
+HEALTH_FILE               = os.path.join("logs", "bot_health.json")  # file output yang dibaca dashboard
 WATCHDOG_TIMEOUT_SEC      = 120               # FROZEN jika > 2 menit tanpa tick
 NO_TRADE_WARN_SEC         = 3 * 3600         # WARN jika > 3 jam tidak ada trade
 MAX_CONSECUTIVE_ERR       = 5               # ERROR jika error berturut-turut >= N

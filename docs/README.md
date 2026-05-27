@@ -55,6 +55,7 @@ BYBIT_DEMO_API_SECRET="secret_demo_kamu"
 
 Lalu edit konfigurasi tambahan di `config.py`:
 
+```python
 SYMBOL = "DOGEUSDT"
 MODE   = "paper"   # "paper" | "demo" | "live"
 
@@ -201,6 +202,87 @@ def on_tick(data):
         execution.place_order(signal)
 ```
 
+---
+
+## 🔬 Hyperparameter Tuning
+
+Cari parameter strategi terbaik secara otomatis via grid search dengan validasi out-of-sample. Semua diatur lewat `tuning_config.py` — tidak ada CLI prompt.
+
+### Cara Pakai
+
+1. **Pastikan parameter di strategy file dideklarasi di atas** (gaya MQL5 input):
+   ```python
+   # strategy.py (atau strategy1.py, strategy_rsi.py, dst)
+   BB_LENGTH       = 20
+   KC_LENGTH       = 20
+   STOP_LOSS_PCT   = 0.008
+   TAKE_PROFIT_PCT = 0.020
+   ```
+
+2. **Edit `tuning_config.py`** — set strategy file, timeframe, rentang data, mode optimasi, model posisi, dan range parameter:
+   ```python
+   STRATEGY_FILE  = "strategy"        # nama file tanpa .py
+   TIMEFRAME      = "2h"              # 1m, 5m, 15m, 30m, 1h, 2h, 4h, 1d
+   DAYS_BACK      = 90                # rentang data dari sekarang
+   OPTIM_MODE     = "balanced"        # profit | drawdown | balanced
+   POSITION_MODEL = "single"          # single | multi
+   PARAMS = {
+       "BB_LENGTH":       [15, 25, 3],            # [start, end, jumlah] → [15, 20, 25]
+       "KC_LENGTH":       [15, 25, 3],
+       "STOP_LOSS_PCT":   [0.005, 0.015, 3],      # float → [0.005, 0.01, 0.015]
+       "TAKE_PROFIT_PCT": [0.010, 0.040, 4],
+   }
+   ```
+
+3. **Jalankan**:
+   ```bash
+   python hypertune.py
+   ```
+
+   Program otomatis: download OHLC dari Bybit → save CSV ke `data/` → split 80% in-sample / 20% out-of-sample → grid search → validasi top 10 di OOS → **print top 3 di CMD**.
+
+### Format `PARAMS`
+
+| Format | Contoh | Hasil |
+|---|---|---|
+| **Range `[start, end, N]`** | `[10, 30, 5]` | `[10, 15, 20, 25, 30]` — linspace N nilai |
+| **Range float** | `[0.005, 0.020, 4]` | `[0.005, 0.01, 0.015, 0.02]` — auto-detect float |
+| **Discrete list** | `[True, False]` | `[True, False]` — apa pun yang bukan format range |
+| **4 elemen+** | `[10, 15, 20, 25]` | discrete, pakai apa adanya |
+
+Auto-detect tipe: kalau start & end keduanya `int` → hasil int (dedup setelah round). Selain itu → float dengan presisi bersih.
+
+### Mode Optimasi
+
+| Mode | Skor |
+|---|---|
+| `profit` | Total PnL (USDT) — cari profit terbesar |
+| `drawdown` | `-max_drawdown_pct` — cari drawdown terkecil |
+| `balanced` | Sharpe ratio (return/risk) — paling direkomendasikan |
+
+### Model Posisi
+
+| Mode | Cara kerja | Cocok untuk |
+|---|---|---|
+| `single` | 1 posisi aktif. Strategy handle entry + exit (return `close` saat mau keluar). | **Tuning realistis** untuk dipakai bot live |
+| `multi` | Tiap `buy`/`sell` = trade independen. Simulator handle exit pakai `STOP_LOSS_PCT` & `TAKE_PROFIT_PCT` dari strategy file. | Analisa kualitas sinyal mentah |
+
+> ⚠️ **Multi-position tidak realistis untuk live trading bot ini** (bot fisik selalu single-position via `bot_state` & `position_manager`). Pakai single untuk tuning yang akan dieksekusi live.
+
+### Output (di CMD)
+
+Untuk tiap dari top 3 ditampilkan:
+- **Parameter** yang ditemukan
+- **In-Sample (80%)** & **Out-of-Sample (20%)**: PnL (USDT + %), Trades, Win Rate, Max DD, Profit Factor, Sharpe, Max Consecutive Wins, Max Consecutive Losses
+
+CSV OHLC tersimpan di `data/<SYMBOL>_<TF>_<startdate>_<enddate>.csv` untuk analisa manual.
+
+### Catatan Penting
+
+- Hasil **hanya tampil di CMD** — strategy file TIDAK diubah otomatis. Copy nilai best ke strategy file kalau mau pakai live.
+- Out-of-sample yang jelek padahal in-sample bagus = **overfitting**, jangan dipakai.
+- **Support strategi apa pun** yang ikut 4 syarat: ada di folder ini, expose `generate_signal(data)`, parameter dideklarasi di atas file, nama param di `PARAMS` match dengan variabel di strategy file. Ganti strategi cukup ubah `STRATEGY_FILE` di config, tidak perlu edit `hypertune.py`.
+
 ### Data tersedia di `data` dict
 
 | Key | Isi |
@@ -327,6 +409,9 @@ bot/
 ├── data_resampler.py     ← Tick → candle realtime (aktif jika DATA_MODE="tick")
 ├── strategy.py           ←  USER EDIT DI SINI (cukup tulis generate_signal)
 ├── strategy_runtime.py   ←  Engine orkestrator (signal → record → execute)
+├── hypertune.py          ← 🔬 Hyperparameter tuning CLI (grid search + 80/20 split)
+├── tuning_config.py      ← 🔬 Konfigurasi tuning (STRATEGY_FILE, TIMEFRAME, PARAMS, dll)
+├── data/                 ← 🔬 OHLC CSV hasil download hypertune (auto-generated)
 ├── tests/                ←  pytest suite (65 test, coverage 72%) — `python -m pytest`
 ├── pytest.ini            ←  Konfigurasi pytest
 ├── strategy_sqz_backup.py← Backup strategi Squeeze Momentum asli

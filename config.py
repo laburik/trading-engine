@@ -15,15 +15,27 @@ load_dotenv()
 # config.py — Central Configuration for Trading Bot System
 # =============================================================================
 
-# --- API Credentials (Live) ---
-API_KEY    = os.getenv("BYBIT_LIVE_API_KEY", "")
-API_SECRET = os.getenv("BYBIT_LIVE_API_SECRET", "")
+# --- Exchange ---
+# Nama exchange (CCXT). Pilihan umum yang di-test: bybit, binance, okx, bitget.
+# Lihat daftar lengkap: https://docs.ccxt.com/#/?id=exchanges
+#
+# Catatan SYMBOL: tulis sesuai format raw exchange yang dipilih.
+#   - bybit, binance: "XRPUSDT"
+#   - okx           : "XRP-USDT-SWAP"
+#   - bitget        : "XRPUSDT_UMCBL"
+EXCHANGE = "bybit"
 
-# --- API Credentials (Demo) ---
-# Daftar di: https://www.bybit.com/en/promo/global/demo-trading
-# Lalu buat API Key di akun Demo kamu
-DEMO_API_KEY    = os.getenv("BYBIT_DEMO_API_KEY", "")
-DEMO_API_SECRET = os.getenv("BYBIT_DEMO_API_SECRET", "")
+# --- API Credentials (Live) ---
+# Variabel env generik (rekomendasi): EXCHANGE_API_KEY / EXCHANGE_API_SECRET
+# Fallback ke BYBIT_LIVE_* untuk kompatibilitas dengan setup .env lama.
+API_KEY    = os.getenv("EXCHANGE_API_KEY",    os.getenv("BYBIT_LIVE_API_KEY", ""))
+API_SECRET = os.getenv("EXCHANGE_API_SECRET", os.getenv("BYBIT_LIVE_API_SECRET", ""))
+
+# --- API Credentials (Demo/Testnet) ---
+# Bybit: daftar di https://www.bybit.com/en/promo/global/demo-trading
+# Exchange lain: buat API key di testnet site exchange tersebut
+DEMO_API_KEY    = os.getenv("EXCHANGE_DEMO_API_KEY",    os.getenv("BYBIT_DEMO_API_KEY", ""))
+DEMO_API_SECRET = os.getenv("EXCHANGE_DEMO_API_SECRET", os.getenv("BYBIT_DEMO_API_SECRET", ""))
 
 # --- Symbol & Market ---
 SYMBOL = "XRPUSDT"
@@ -31,8 +43,11 @@ CATEGORY = "linear"  # "linear" for USDT-perp, "inverse" for coin-margined
 
 # --- Trading Mode ---
 # "paper" = simulasi lokal, tidak perlu API key
-# "demo"  = Bybit Demo API, PnL dari Bybit (perlu DEMO_API_KEY)
-# "live"  = Bybit Live API, uang nyata (perlu API_KEY)
+# "demo"  = simulasi pakai exchange API. Behavior tergantung EXCHANGE:
+#             - bybit       : Bybit Demo (data live REAL + fill simulasi) — paling realistis
+#             - exchange lain: testnet (data testnet + fill testnet) — kurang realistis
+#                              karena harga testnet bisa drift dari market real
+# "live"  = Live API, uang nyata (perlu API_KEY)
 MODE = "paper"
 
 # --- Account ---
@@ -73,14 +88,19 @@ TIMEFRAMES = {
     "2h":  (7200, 100),   # 2 jam,    simpan 100 candle   ← contoh tambah
 }
 
+# --- Runtime files (auto-generated, disimpan di logs/) ---
+# Folder logs/ otomatis dibuat di bawah supaya bot tidak crash saat write pertama.
+LOGS_DIR = "logs"
+os.makedirs(LOGS_DIR, exist_ok=True)
+
 # --- Heartbeat ---
-HEARTBEAT_FILE = "heartbeat.json"
+HEARTBEAT_FILE = os.path.join(LOGS_DIR, "heartbeat.json")
 HEARTBEAT_INTERVAL_SEC = 1     # How often heartbeat updates
 HEARTBEAT_TIMEOUT_SEC = 5      # Dashboard considers bot OFFLINE after this
 
 # --- Logging ---
-TRADE_HISTORY_FILE = "trade_history.csv"
-EQUITY_CURVE_FILE = "equity_curve.csv"
+TRADE_HISTORY_FILE = os.path.join(LOGS_DIR, "trade_history.csv")
+EQUITY_CURVE_FILE = os.path.join(LOGS_DIR, "equity_curve.csv")
 
 # --- Bybit WebSocket URLs ---
 WS_PUBLIC_URL    = "wss://stream.bybit.com/v5/public/linear"

@@ -5,8 +5,12 @@ import signal
 import time
 import streamlit as st
 
-# Tambahkan root folder ke path agar preflight_check bisa diimport dari /pages/
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Tambahkan root folder + engine/ ke path agar preflight_check (di engine/)
+# bisa di-import flat dari /pages/.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (_ROOT, os.path.join(_ROOT, "engine")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 import preflight_check
 
 st.set_page_config(page_title="⚙️ Bot Control", page_icon="⚙️", layout="wide")
@@ -21,6 +25,7 @@ st.markdown("""
 
 BOT_PID_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "logs",
     "bot_pid.txt"
 )
 

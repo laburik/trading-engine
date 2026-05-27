@@ -1,14 +1,21 @@
+import os
 import sys
+
+# Tambahkan project root dan engine/ ke sys.path supaya import flat tetap jalan
+# meskipun file ini berada di subfolder pages/.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (_ROOT, os.path.join(_ROOT, "engine")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import time
-import requests
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import ccxt  # sync CCXT untuk fetch historis (bukan ccxt.pro)
 import numpy as np
 import pandas as pd
 import streamlit as st
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
-from config import SYMBOL, INITIAL_BALANCE, FEE_RATE
+from config import SYMBOL, INITIAL_BALANCE, FEE_RATE, EXCHANGE
 
 st.set_page_config(page_title="🔬 Backtest", page_icon="🔬", layout="wide")
 
@@ -21,29 +28,49 @@ st.markdown("""
 # =============================================================================
 # HELPERS
 # =============================================================================
-_BYBIT_TF_MAP = {
-    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
-    "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720", "1d": "D",
+# CCXT menerima timeframe string langsung — map di bawah cuma untuk hitung interval_sec
+_TF_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "12h": 43200, "1d": 86400,
 }
+_BYBIT_TF_MAP = _TF_SECONDS  # backward-compat untuk selectbox di UI (key list-nya sama)
 
 def _ts(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
+@st.cache_resource(show_spinner=False)
+def _get_ccxt_client(exchange_name: str):
+    """Instance CCXT sync (cache per session). load_markets() dipanggil sekali."""
+    try:
+        cls = getattr(ccxt, exchange_name)
+    except AttributeError as e:
+        raise ValueError(
+            f"EXCHANGE '{exchange_name}' tidak ada di ccxt. "
+            f"Cek https://docs.ccxt.com/#/?id=exchanges"
+        ) from e
+    ex = cls({"enableRateLimit": True, "options": {"defaultType": "linear"}})
+    ex.load_markets()
+    return ex
+
+
+def _resolve_symbol(ex, raw_symbol: str) -> str:
+    """Resolve raw symbol (exchange format) → CCXT unified symbol."""
+    m = ex.markets_by_id.get(raw_symbol)
+    if isinstance(m, list):
+        m = m[0]
+    return m["symbol"] if m else raw_symbol
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_backtest_candles(symbol: str, interval_label: str, limit: int) -> list:
-    bybit_interval = _BYBIT_TF_MAP.get(interval_label, "1")
-    interval_min   = int(bybit_interval) if bybit_interval.isdigit() else 1440
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": "linear", "symbol": symbol, "interval": bybit_interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=15, verify=False)
+    interval_sec = _TF_SECONDS.get(interval_label, 60)
+    ex = _get_ccxt_client(EXCHANGE)
+    ccxt_symbol = _resolve_symbol(ex, symbol)
     try:
-        body = resp.json()
+        rows = ex.fetch_ohlcv(ccxt_symbol, timeframe=interval_label, limit=limit)
     except Exception as e:
-        raise ValueError(f"Bukan JSON (HTTP {resp.status_code}): {resp.text[:200]}")
-    if body.get("retCode") != 0:
-        raise ValueError(f"Bybit API error: {body.get('retMsg', '')}")
-    rows = sorted(body["result"]["list"], key=lambda r: int(r[0]))
-    interval_sec = interval_min * 60
+        raise ValueError(f"{EXCHANGE} fetch_ohlcv error: {e}")
+    rows = sorted(rows, key=lambda r: int(r[0]))
     if rows:
         newest_ms = int(rows[-1][0])
         if newest_ms + interval_sec * 1000 > int(time.time() * 1000):

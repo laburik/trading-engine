@@ -8,30 +8,48 @@ from __future__ import annotations
 
 import logging
 import ccxt.pro as ccxt
-from config import ACTIVE_API_KEY, ACTIVE_API_SECRET, MODE, SYMBOL
+from config import ACTIVE_API_KEY, ACTIVE_API_SECRET, MODE, SYMBOL, EXCHANGE
 
 logger = logging.getLogger("ccxt_client")
 
+# --- Resolve kelas exchange dari nama (CCXT Pro) ---
+# `getattr(ccxt, "bybit")` ≡ `ccxt.bybit`. Hanya exchange yang tersedia di CCXT
+# Pro yang bisa dipakai (sebagian besar major exchanges mendukung WebSocket).
+try:
+    _ExchangeClass = getattr(ccxt, EXCHANGE)
+except AttributeError as _e:
+    raise RuntimeError(
+        f"[CCXT] Exchange '{EXCHANGE}' tidak tersedia di ccxt.pro. "
+        f"Cek nama di https://docs.ccxt.com/#/?id=exchanges"
+    ) from _e
+
 # --- Inisialisasi exchange (belum load_markets) ---
-exchange: ccxt.bybit = ccxt.bybit({
+exchange = _ExchangeClass({
     "apiKey":          ACTIVE_API_KEY,
     "secret":          ACTIVE_API_SECRET,
     "enableRateLimit": True,
     "options": {
-        "defaultType":             "linear",   # USDT-perp
+        "defaultType":             "linear",   # USDT-perp (Bybit/Binance); exchange lain auto-pilih default
         "adjustForTimeDifference": False,       # Nonaktifkan panggilan /market/time
-        # Hanya load linear markets saat load_markets() — skip spot/inverse/option
-        "fetchMarkets": {
-            "types":   ["linear"],
-            "options": [],
-        },
     },
 })
 
-# Demo mode pakai hostname berbeda
+# Demo mode: behavior berbeda per exchange.
+#   - Bybit  → pakai endpoint demo (data live REAL + fill simulasi)
+#   - Lain   → pakai testnet via set_sandbox_mode(True) (data testnet, kurang akurat)
 if MODE == "demo":
-    exchange.set_sandbox_mode(False)
-    exchange.hostname = "api-demo.bybit.com"
+    if EXCHANGE == "bybit":
+        exchange.set_sandbox_mode(False)
+        exchange.hostname = "api-demo.bybit.com"
+    else:
+        try:
+            exchange.set_sandbox_mode(True)
+            logger.info(f"[CCXT] {EXCHANGE}: testnet/sandbox mode active.")
+        except Exception as _e:
+            logger.warning(
+                f"[CCXT] {EXCHANGE} tidak support sandbox mode: {_e}. "
+                f"Mode demo akan jalan di live endpoint (risiko: API call ke live)."
+            )
 
 # Unified CCXT symbol (diisi saat init_exchange() dipanggil)
 # Contoh: "XRPUSDT" → "XRP/USDT:USDT"

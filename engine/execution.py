@@ -86,29 +86,164 @@ def _round_to_step(value: float, step: float) -> float:
 
 
 # =============================================================================
-# PRICE VALIDATION (slippage check)
+# STALE DATA DETECTION
 # =============================================================================
-def _validate_price(side: str, intended_price: float) -> tuple[bool, str]:
-    """
-    Check whether the current market price is within slippage tolerance.
+# Maksimum umur data best_bid/best_ask sebelum dianggap basi.
+# WebSocket Bybit update orderbook setiap ~100ms saat aktif.
+# 2 detik = 20× normal interval — kalau lebih, WS pasti bermasalah (disconnect).
+# Threshold ini intentional konservatif: lebih baik miss 1-2 trade daripada
+# eksekusi pakai harga yang sudah jauh bergerak.
+STALE_DATA_THRESHOLD_SEC: float = 2.0
 
-    BUY  → execute at ASK; reject if ASK has drifted > tolerance above intended
-    SELL → execute at BID; reject if BID has drifted > tolerance below intended
-    """
-    ask: float = data_stream.best_ask.get("price", 0.0)
-    bid: float = data_stream.best_bid.get("price", 0.0)
 
+def _check_stale_data() -> tuple[bool, str]:
+    """
+    Cek apakah best_bid/best_ask masih fresh (di-update dalam STALE_DATA_THRESHOLD_SEC
+    detik terakhir). Return (True, "") kalau OK, (False, reason) kalau basi.
+    """
+    now: float = time.time()
+    bid_ts: float = data_stream.best_bid_updated_at
+    ask_ts: float = data_stream.best_ask_updated_at
+
+    if bid_ts == 0.0 or ask_ts == 0.0:
+        return False, "Market data not yet received (bid/ask timestamp = 0)"
+
+    bid_age: float = now - bid_ts
+    ask_age: float = now - ask_ts
+
+    if bid_age > STALE_DATA_THRESHOLD_SEC:
+        return False, f"Stale bid data: {bid_age:.2f}s old (threshold {STALE_DATA_THRESHOLD_SEC}s)"
+    if ask_age > STALE_DATA_THRESHOLD_SEC:
+        return False, f"Stale ask data: {ask_age:.2f}s old (threshold {STALE_DATA_THRESHOLD_SEC}s)"
+
+    return True, ""
+
+
+# =============================================================================
+# ORDERBOOK DEPTH-AWARE VWAP
+# =============================================================================
+def _calculate_vwap(side: str, qty: float) -> tuple[Optional[float], float, str]:
+    """
+    Walk orderbook untuk hitung VWAP (Volume Weighted Average Price) fill price
+    untuk order size `qty`. Mensimulasikan apa yang akan dibayar saat market order
+    menelusuri beberapa level orderbook.
+
+    Args:
+        side: "buy" → walk ASKs (ascending price)
+              "sell" → walk BIDs (descending price)
+        qty:  total quantity yang mau di-eksekusi
+
+    Returns:
+        (vwap, qty_fillable, error)
+          vwap          : harga rata-rata weighted by quantity per level
+          qty_fillable  : total qty yang bisa ter-fill dari book (≤ qty)
+          error         : reason string kalau gagal, "" kalau OK
+
+        Return (None, 0.0, reason) kalau book kosong / tidak ada liquidity.
+    """
+    if qty <= 0:
+        return None, 0.0, f"Invalid qty: {qty}"
+
+    book = data_stream.orderbook_snapshot
     if side == "buy":
-        live_price: float = ask
-        drift: float = (live_price - intended_price) / intended_price if intended_price else 0
-        if drift > SLIPPAGE_TOLERANCE:
-            return False, f"Slippage exceeded on BUY: live_ask={live_price} vs intended={intended_price} drift={drift:.5f}"
-
+        # ASKs ascending (harga terendah dulu — kita beli dari penjual paling murah)
+        levels = list(book["asks"].items())
     elif side == "sell":
-        live_price = bid
-        drift = (intended_price - live_price) / intended_price if intended_price else 0
+        # BIDs descending (harga tertinggi dulu — kita jual ke pembeli paling tinggi)
+        levels = list(reversed(book["bids"].items()))
+    else:
+        return None, 0.0, f"Invalid side: {side}"
+
+    if not levels:
+        return None, 0.0, f"Orderbook {side} side empty"
+
+    total_cost: float = 0.0
+    total_qty: float = 0.0
+    remaining: float = qty
+
+    for price, level_qty in levels:
+        take: float = min(level_qty, remaining)
+        total_cost += take * price
+        total_qty += take
+        remaining -= take
+        if remaining <= 1e-9:
+            break
+
+    if total_qty <= 0:
+        return None, 0.0, "No liquidity available"
+
+    vwap: float = total_cost / total_qty
+    return vwap, total_qty, ""
+
+
+# =============================================================================
+# PRICE VALIDATION (stale check + VWAP slippage + liquidity check)
+# =============================================================================
+# Toleransi liquidity: order anggap OK kalau book bisa fill minimal X% dari qty.
+# 0.99 = book minimal punya 99% liquidity yang dibutuhkan.
+LIQUIDITY_THRESHOLD: float = 0.99
+
+
+def _validate_price(side: str, intended_price: float, qty: float = 0.0) -> tuple[bool, str]:
+    """
+    Validasi pre-order. Reject kalau:
+      1. Data bid/ask sudah basi (WS disconnect / stale)
+      2. Liquidity di orderbook tidak cukup untuk qty
+      3. VWAP slippage > SLIPPAGE_TOLERANCE vs intended_price
+
+    Kalau qty=0 (legacy/paper mode tanpa hitung qty), skip check #2 dan #3,
+    fallback ke best-bid/ask drift check seperti versi sebelumnya.
+    """
+    # --- 1. Stale data check ---
+    ok, err = _check_stale_data()
+    if not ok:
+        return False, err
+
+    # --- Kalau qty tidak disediakan, pakai best-level drift check (legacy behavior) ---
+    if qty <= 0:
+        ask: float = data_stream.best_ask.get("price", 0.0)
+        bid: float = data_stream.best_bid.get("price", 0.0)
+        if side == "buy":
+            drift: float = (ask - intended_price) / intended_price if intended_price else 0
+            if drift > SLIPPAGE_TOLERANCE:
+                return False, f"Slippage exceeded BUY: live_ask={ask} vs intended={intended_price} drift={drift:.5f}"
+        elif side == "sell":
+            drift = (intended_price - bid) / intended_price if intended_price else 0
+            if drift > SLIPPAGE_TOLERANCE:
+                return False, f"Slippage exceeded SELL: live_bid={bid} vs intended={intended_price} drift={drift:.5f}"
+        return True, ""
+
+    # --- 2. VWAP & liquidity check (depth-aware) ---
+    vwap: Optional[float]
+    fillable: float
+    vwap_err: str
+    vwap, fillable, vwap_err = _calculate_vwap(side, qty)
+    if vwap is None:
+        return False, f"VWAP calc failed: {vwap_err}"
+
+    if fillable < qty * LIQUIDITY_THRESHOLD:
+        return False, (
+            f"Insufficient liquidity for {side} {qty:.6f}: book only has "
+            f"{fillable:.6f} ({fillable/qty*100:.1f}% of needed)"
+        )
+
+    # --- 3. VWAP slippage vs intended ---
+    if side == "buy":
+        drift = (vwap - intended_price) / intended_price if intended_price else 0
         if drift > SLIPPAGE_TOLERANCE:
-            return False, f"Slippage exceeded on SELL: live_bid={live_price} vs intended={intended_price} drift={drift:.5f}"
+            return False, (
+                f"VWAP slippage exceeded BUY: vwap={vwap:.6f} vs "
+                f"intended={intended_price:.6f} drift={drift*100:.3f}% "
+                f"(tolerance {SLIPPAGE_TOLERANCE*100:.3f}%)"
+            )
+    elif side == "sell":
+        drift = (intended_price - vwap) / intended_price if intended_price else 0
+        if drift > SLIPPAGE_TOLERANCE:
+            return False, (
+                f"VWAP slippage exceeded SELL: vwap={vwap:.6f} vs "
+                f"intended={intended_price:.6f} drift={drift*100:.3f}% "
+                f"(tolerance {SLIPPAGE_TOLERANCE*100:.3f}%)"
+            )
 
     return True, ""
 
@@ -138,7 +273,7 @@ def _paper_execute(signal: Signal) -> OrderResult:
         exec_price: float = ask
         ok: bool
         err: str
-        ok, err = _validate_price("buy", signal.get("price", exec_price))
+        ok, err = _validate_price("buy", signal.get("price", exec_price), qty)
         if not ok:
             logger.warning(err)
             return {"status": "rejected", "reason": err}
@@ -162,7 +297,7 @@ def _paper_execute(signal: Signal) -> OrderResult:
 
     elif action == "sell":
         exec_price = bid
-        ok, err = _validate_price("sell", signal.get("price", exec_price))
+        ok, err = _validate_price("sell", signal.get("price", exec_price), qty)
         if not ok:
             logger.warning(err)
             return {"status": "rejected", "reason": err}
@@ -262,6 +397,15 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
     """
     Execute order via CCXT (Bybit REST API, async).
     CCXT menangani signing, header, dan parsing response secara otomatis.
+
+    Error handling kategorisasi:
+      - reduceOnly rejected (Hedge mode) → retry tanpa flag
+      - Insufficient balance/margin    → NO RETRY (fail fast, retry tidak akan fix)
+      - Order size invalid (min/max)    → NO RETRY (config issue, butuh intervensi)
+      - Insufficient liquidity          → NO RETRY (book tidak cukup, retry sia-sia)
+      - Rate limit (429)                → RETRY dengan backoff lebih panjang
+      - Network/timeout/generic        → RETRY normal (default 20ms delay)
+      - Partial fill                    → kalau CANCEL_ON_PARTIAL=True, cancel sisa
     """
     action: str = signal["action"]
     pos: dict[str, object] = position_manager.get_position()
@@ -299,13 +443,13 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
     else:
         qty = qty_val
 
-    # Slippage check
+    # Pre-order validation: stale data + VWAP slippage + liquidity (depth-aware)
     validate_side: str = action if action != "close" else ("sell" if str(pos["side"]) == "long" else "buy")
     ok: bool
     err: str
-    ok, err = _validate_price(validate_side, price)
+    ok, err = _validate_price(validate_side, price, qty)
     if not ok:
-        logger.warning(err)
+        logger.warning(f"[LIVE] Pre-order validation rejected: {err}")
         return {"status": "rejected", "reason": err}
 
     reduce_only: bool = (action == "close")
@@ -324,27 +468,81 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
                 },
             )
             order_id: str = str(order.get("id", ""))
-            logger.info(f"[LIVE] Order placed: {ccxt_side} {qty} {SYMBOL} @ market | orderId={order_id}")
-            return {"status": "filled", "price": price, "qty": qty, "orderId": order_id}
+
+            # Partial fill detection — Bybit market order biasanya full-fill,
+            # tapi di market thin atau saat volatil bisa partial.
+            filled: float = float(order.get("filled", qty) or qty)
+            if filled < qty * 0.999:  # toleransi 0.1% untuk rounding
+                shortfall_pct: float = (1 - filled / qty) * 100
+                logger.warning(
+                    f"[LIVE] PARTIAL FILL: requested={qty:.6f}, "
+                    f"filled={filled:.6f} ({shortfall_pct:.2f}% short) | orderId={order_id}"
+                )
+                if CANCEL_ON_PARTIAL:
+                    # Untuk market order biasanya tidak ada sisa pending, tapi
+                    # kalau ada (limit IOC future-proof), cancel sisa eksplisit.
+                    try:
+                        await exchange.cancel_order(order_id, ccxt_client.CCXT_SYMBOL)
+                        logger.info(f"[LIVE] Cancelled unfilled remainder of order {order_id}")
+                    except Exception as cancel_err:
+                        logger.warning(f"[LIVE] Cancel remainder failed (likely already done): {cancel_err}")
+
+            logger.info(f"[LIVE] Order placed: {ccxt_side} {filled} {SYMBOL} @ market | orderId={order_id}")
+            return {"status": "filled", "price": price, "qty": filled, "orderId": order_id}
 
         except ccxt.BadRequest as e:
-            # Fix 4: Bybit Hedge Mode menolak reduceOnly=True
-            # → Retry tanpa flag agar order close tetap berhasil.
-            if reduce_only and ("reduceOnly" in str(e) or "110025" in str(e)):
+            err_str: str = str(e)
+
+            # Hedge mode reduceOnly fallback (sudah ada sebelumnya)
+            if reduce_only and ("reduceOnly" in err_str or "110025" in err_str):
                 logger.warning(
                     "[LIVE] reduceOnly ditolak Bybit (Hedge Mode terdeteksi). "
                     "Retry tanpa reduceOnly..."
                 )
                 reduce_only = False
                 continue
+
+            # NO RETRY errors — kondisi yang tidak akan fix dengan retry
+            # Insufficient balance/margin: butuh tambah modal, bukan masalah transient
+            if any(code in err_str for code in ("110007", "110021", "insufficient", "Insufficient")):
+                logger.error(f"[LIVE] FATAL: Insufficient balance/margin — order tidak dieksekusi: {e}")
+                return {"status": "rejected", "reason": f"Insufficient balance: {err_str[:100]}"}
+
+            # Order size invalid: min/max size, leverage mismatch — butuh fix config
+            if any(code in err_str for code in ("110013", "110014", "110028", "110045", "min order")):
+                logger.error(f"[LIVE] FATAL: Order size/leverage invalid — cek config: {e}")
+                return {"status": "rejected", "reason": f"Invalid order params: {err_str[:100]}"}
+
+            # Insufficient liquidity untuk market order
+            if "170131" in err_str or "liquidity" in err_str.lower():
+                logger.warning(f"[LIVE] Bybit reject: insufficient liquidity — book thin")
+                return {"status": "rejected", "reason": f"Insufficient liquidity at Bybit"}
+
+            # BadRequest lain — retry sekali, mungkin transient
             logger.warning(f"[LIVE] Order attempt {attempt} BadRequest: {e}")
 
+        except ccxt.RateLimitExceeded as e:
+            # CCXT auto-throttle sudah on (enableRateLimit=True), kalau masih kena
+            # berarti burst → tunggu lebih lama sebelum retry
+            backoff: float = (RETRY_DELAY_MS / 1000) * (2 ** attempt)
+            logger.warning(f"[LIVE] Rate limit hit (attempt {attempt}). Backoff {backoff:.2f}s: {e}")
+            await asyncio.sleep(backoff)
+            continue
+
+        except (ccxt.NetworkError, ccxt.ExchangeNotAvailable, asyncio.TimeoutError) as e:
+            logger.warning(f"[LIVE] Network/exchange unavailable (attempt {attempt}): {type(e).__name__}: {e}")
+            # Retry normal — kemungkinan transient
+
+        except ccxt.AuthenticationError as e:
+            logger.error(f"[LIVE] FATAL: Authentication error — cek API key di .env: {e}")
+            return {"status": "rejected", "reason": "Authentication failed — invalid API key"}
+
         except Exception as e:
-            logger.error(f"[LIVE] Order attempt {attempt} exception: {e}")
+            logger.error(f"[LIVE] Order attempt {attempt} unhandled exception {type(e).__name__}: {e}")
 
         await asyncio.sleep(RETRY_DELAY_MS / 1000)
 
-    return {"status": "failed", "reason": "Max retries exceeded"}
+    return {"status": "failed", "reason": f"Max retries ({MAX_RETRY}) exceeded"}
 
 
 # =============================================================================

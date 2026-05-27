@@ -17,8 +17,8 @@ from ft_types import BotState, MarketDataSnapshot, Signal
 # ==========================================
 # ML sepenuhnya opsional — jika file .pkl tidak ditemukan, model = None
 # dan strategy bisa tetap jalan menggunakan logika indikator biasa.
-MODEL_PATH  = 'trading_model_15m.pkl'
-SCALER_PATH = 'trading_scaler_15m.pkl'
+MODEL_PATH  = os.path.join('models', 'trading_model_15m.pkl')
+SCALER_PATH = os.path.join('models', 'trading_scaler_15m.pkl')
 
 try:
     from sklearn.exceptions import InconsistentVersionWarning

@@ -51,6 +51,11 @@ funding_rate: FundingRateState = {"value": 0.0, "next_funding_time": 0, "predict
 # Latest best bid/ask (updated from orderbook stream)
 best_bid: BidAskLevel = {"price": 0.0, "qty": 0.0}
 best_ask: BidAskLevel = {"price": 0.0, "qty": 0.0}
+# Unix timestamp saat best_bid/best_ask terakhir di-update.
+# Dipakai execution._check_stale_data() untuk reject order kalau WS disconnect
+# dan data jadi basi (mencegah eksekusi pakai harga lama saat reconnect).
+best_bid_updated_at: float = 0.0
+best_ask_updated_at: float = 0.0
 last_prices: dict[str, float] = {}  # Injected for real-time dashboard display per timeframe
 
 # Orderbook snapshot (SortedDict keyed by price level → qty)
@@ -108,18 +113,22 @@ async def _funding_rate_loop() -> None:
 # =============================================================================
 def _update_best_bid_ask() -> None:
     """Recalculate best bid and best ask from snapshot."""
+    global best_bid_updated_at, best_ask_updated_at
     bids: SortedDict = orderbook_snapshot["bids"]
     asks: SortedDict = orderbook_snapshot["asks"]
 
+    now: float = time.time()
     if bids:
         best_price, qty = bids.peekitem(-1)
         best_bid["price"] = best_price
         best_bid["qty"] = qty
+        best_bid_updated_at = now
 
     if asks:
         best_price, qty = asks.peekitem(0)
         best_ask["price"] = best_price
         best_ask["qty"] = qty
+        best_ask_updated_at = now
 
 
 def _process_ccxt_orderbook(ob: dict) -> None:
