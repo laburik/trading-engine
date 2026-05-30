@@ -26,8 +26,8 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
-import math
-from typing import Optional
+from decimal import ROUND_DOWN
+from typing import Any, Optional
 import ccxt.pro as ccxt
 from config import (
     SYMBOL, MODE,
@@ -37,6 +37,7 @@ from config import (
 from ccxt_client import exchange
 import ccxt_client
 from ft_types import OrderResult, Signal
+from precision import to_decimal
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,6 +48,12 @@ logger = logging.getLogger("execution")
 # BUG-05 FIX: Set untuk menyimpan referensi task fire-and-forget.
 # Tanpa ini, Python GC bisa menghapus task sebelum selesai dieksekusi.
 _background_tasks: set[asyncio.Task[None]] = set()
+
+# Duplicate-fire guard (demo/live): True selama 1 order live masih in-flight
+# (sudah di-dispatch tapi belum konfirmasi + state belum ke-update). Mencegah
+# tick 100ms berikutnya men-dispatch order kembar saat state belum sync.
+# Lihat place_order() & _live_place_order_async() (bug 2026-05-29).
+_live_order_in_flight: bool = False
 
 # Import live prices and position manager
 import data_stream
@@ -78,11 +85,106 @@ async def _get_qty_step() -> float:
 
 
 def _round_to_step(value: float, step: float) -> float:
+    """
+    Floor `value` ke kelipatan `step` (konservatif: jangan over-order).
+
+    Pakai Decimal fixed-point (precision.to_decimal), BUKAN float — bug lama:
+    floor(0.3 / 0.1) di float = floor(2.9999...) = 2 -> 0.2 (kehilangan 1 step
+    penuh). Decimal: 0.3 / 0.1 = 3 -> 0.3. Lihat tests/test_precision.py.
+    """
     if step <= 0:
         return value
-    precision: int = max(0, int(round(-math.log10(step))))
-    rounded: float = math.floor(value / step) * step
-    return round(rounded, precision)
+    d = to_decimal(value)
+    s = to_decimal(step)
+    steps = (d / s).to_integral_value(rounding=ROUND_DOWN)
+    return float(steps * s)
+
+
+# =============================================================================
+# ORDER FILL PARSER
+# =============================================================================
+def _parse_order_fill(
+    order: dict,
+    requested_qty: float,
+) -> tuple[float, Optional[OrderResult]]:
+    """
+    Parse fill info dari CCXT order response — distinguish missing field vs zero fill.
+
+    Bug yang di-prevent: `float(order.get("filled", qty) or qty)` membuat zero fill
+    (silent reject dari matching engine) terlihat seperti full fill.
+
+    Logika:
+      - filled=None  + status closed/filled → fallback ke requested_qty + warn
+      - filled=None  + status lain          → treat zero, return failure
+      - filled=0     (explicit)             → SILENT REJECT, return failure
+      - filled>0                            → ok, return value
+
+    Returns:
+        (filled_amount, error_result):
+          error_result = None  → order ok, lanjut partial-fill detection
+          error_result = dict  → caller harus return ini langsung
+    """
+    order_id: str = str(order.get("id", ""))
+    order_status: str = str(order.get("status", "unknown")).lower()
+    filled_raw: Any = order.get("filled")
+
+    if filled_raw is None:
+        # CCXT kadang tidak isi 'filled' kalau matching async (Bybit specifically).
+        # Status optimistic = anggap order ok, PnL sync nanti reconcile:
+        #   - "closed"/"filled"  → order tidak active lagi (fully filled atau cancel)
+        #   - "none"             → Bybit demo quirk untuk market order async ack.
+        #                          Response balik instant sebelum fill konfirmasi datang.
+        #                          Kalau treat as failure, state lokal desync dari exchange
+        #                          (bug yang ke-detect saat smoke test demo 2026-05-29).
+        OPTIMISTIC_STATUSES = ("closed", "filled", "none")
+        if order_status in OPTIMISTIC_STATUSES:
+            if order_status == "none":
+                logger.warning(
+                    f"[LIVE] Order {order_id}: status='none' (async ack dari exchange). "
+                    f"Asumsi full fill={requested_qty}. PnL sync akan verifikasi state."
+                )
+            else:
+                logger.warning(
+                    f"[LIVE] Order {order_id}: 'filled' missing tapi status='{order_status}'. "
+                    f"Asumsi full fill={requested_qty}. Verifikasi via position_manager sync."
+                )
+            return requested_qty, None
+        logger.error(
+            f"[LIVE] Order {order_id}: 'filled' missing & status='{order_status}' "
+            f"(bukan closed/filled/none). Treating as zero-fill failure."
+        )
+        return 0.0, {
+            "status": "failed",
+            "reason": f"No fill info from exchange (orderId={order_id}, status={order_status})",
+        }
+
+    # Defensive float conversion — kalau exchange return tipe aneh (str non-numeric,
+    # nested dict, dll), jangan crash di hot path. Treat sebagai parse failure.
+    try:
+        filled: float = float(filled_raw)
+    except (TypeError, ValueError) as e:
+        logger.error(
+            f"[LIVE] Order {order_id}: 'filled' value tidak numeric ({filled_raw!r}): {e}"
+        )
+        return 0.0, {
+            "status": "failed",
+            "reason": f"Invalid 'filled' value type (orderId={order_id})",
+        }
+
+    if filled <= 0.0:
+        # Bahaya: orderId valid tapi tidak ada eksekusi — matching engine silent reject.
+        # Sebelumnya `0 or qty` membuat bot mengira full fill — bug ini yang di-fix.
+        logger.error(
+            f"[LIVE] SILENT REJECT detected: order {order_id} status='{order_status}' "
+            f"filled=0 (requested={requested_qty}). Return failed agar state "
+            f"di-rekonsiliasi via position_manager sync."
+        )
+        return 0.0, {
+            "status": "failed",
+            "reason": f"Zero-fill silent reject (orderId={order_id}, status={order_status})",
+        }
+
+    return filled, None
 
 
 # =============================================================================
@@ -95,11 +197,20 @@ def _round_to_step(value: float, step: float) -> float:
 # eksekusi pakai harga yang sudah jauh bergerak.
 STALE_DATA_THRESHOLD_SEC: float = 2.0
 
+# Ambang staleness berbasis ts_event (waktu EXCHANGE). Lebih longgar dari
+# STALE_DATA_THRESHOLD_SEC karena membandingkan jam KITA dengan jam EXCHANGE —
+# sedikit clock skew itu wajar. Tujuannya menangkap feed yang "lag parah" (pesan
+# tetap masuk sehingga waktu-terima fresh, TAPI isinya tua di sisi exchange) —
+# kasus yang luput dari cek waktu-terima. Pola dua-timestamp ala Nautilus.
+EXCHANGE_STALE_THRESHOLD_SEC: float = 5.0
+
 
 def _check_stale_data() -> tuple[bool, str]:
     """
-    Cek apakah best_bid/best_ask masih fresh (di-update dalam STALE_DATA_THRESHOLD_SEC
-    detik terakhir). Return (True, "") kalau OK, (False, reason) kalau basi.
+    Cek apakah best_bid/best_ask masih fresh. Dua lapis:
+      1. Waktu-terima (ts_init): tangkap WS disconnect — data berhenti masuk.
+      2. Waktu-event exchange (ts_event): tangkap feed lag — data masuk tapi tua.
+    Return (True, "") kalau OK, (False, reason) kalau basi.
     """
     now: float = time.time()
     bid_ts: float = data_stream.best_bid_updated_at
@@ -115,6 +226,18 @@ def _check_stale_data() -> tuple[bool, str]:
         return False, f"Stale bid data: {bid_age:.2f}s old (threshold {STALE_DATA_THRESHOLD_SEC}s)"
     if ask_age > STALE_DATA_THRESHOLD_SEC:
         return False, f"Stale ask data: {ask_age:.2f}s old (threshold {STALE_DATA_THRESHOLD_SEC}s)"
+
+    # Lapis 2: cek berbasis ts_event (waktu exchange). Hanya aktif kalau exchange
+    # menyertakan timestamp (>0). getattr default 0.0 supaya aman bila atribut
+    # belum ada (mis. stub data_stream lama di test).
+    bid_event_ts: float = getattr(data_stream, "best_bid_ts_event", 0.0)
+    if bid_event_ts > 0.0:
+        event_age: float = now - bid_event_ts
+        if event_age > EXCHANGE_STALE_THRESHOLD_SEC:
+            return False, (
+                f"Stale exchange data: bid ts_event {event_age:.2f}s old "
+                f"(threshold {EXCHANGE_STALE_THRESHOLD_SEC}s) — feed lag / clock skew?"
+            )
 
     return True, ""
 
@@ -443,6 +566,16 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
     else:
         qty = qty_val
 
+    # Zero-qty guard (pola make_qty Nautilus: qty nol = invalid). Cegah kirim order
+    # ukuran 0 ke exchange — fail fast dengan rejection bersih, bukan dipantulkan
+    # exchange (atau lebih buruk: terkirim sebagai 0 dan bikin state aneh).
+    if qty <= 0:
+        logger.error(
+            f"[LIVE] Order {action} di-reject: qty membulat ke nol (raw size terlalu "
+            f"kecil untuk step). Cek ORDER_SIZE_USDT/LEVERAGE vs harga."
+        )
+        return {"status": "rejected", "reason": "Order size rounds to zero"}
+
     # Pre-order validation: stale data + VWAP slippage + liquidity (depth-aware)
     validate_side: str = action if action != "close" else ("sell" if str(pos["side"]) == "long" else "buy")
     ok: bool
@@ -469,9 +602,17 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
             )
             order_id: str = str(order.get("id", ""))
 
+            # Parse fill — return failure kalau silent-reject (filled=0) atau
+            # status ambiguous. JANGAN pretend full-fill seperti bug lama
+            # (`filled or qty` → 0 or qty → qty meskipun aslinya tidak ter-fill).
+            filled: float
+            parse_err: Optional[OrderResult]
+            filled, parse_err = _parse_order_fill(order, qty)
+            if parse_err is not None:
+                return parse_err
+
             # Partial fill detection — Bybit market order biasanya full-fill,
             # tapi di market thin atau saat volatil bisa partial.
-            filled: float = float(order.get("filled", qty) or qty)
             if filled < qty * 0.999:  # toleransi 0.1% untuk rounding
                 shortfall_pct: float = (1 - filled / qty) * 100
                 logger.warning(
@@ -488,6 +629,20 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
                         logger.warning(f"[LIVE] Cancel remainder failed (likely already done): {cancel_err}")
 
             logger.info(f"[LIVE] Order placed: {ccxt_side} {filled} {SYMBOL} @ market | orderId={order_id}")
+
+            # Tutup race window duplicate-fire: update state posisi lokal SEKARANG,
+            # tanpa nunggu _sync_position (~PNL_SYNC_INTERVAL detik). Tanpa ini, tick
+            # berikutnya masih lihat state lama → strategy fire order kembar. Money
+            # accounting tetap milik sync loop (lihat position_manager.set_position_optimistic).
+            if action == "close":
+                # Hanya clear kalau fill efektif penuh. Partial close (jarang untuk
+                # market reduce-only) dibiarkan agar _sync_position update qty sisa.
+                if filled >= qty * 0.999:
+                    position_manager.clear_position_optimistic()
+            else:
+                position_manager.set_position_optimistic(
+                    "long" if action == "buy" else "short", price, filled
+                )
             return {"status": "filled", "price": price, "qty": filled, "orderId": order_id}
 
         except ccxt.BadRequest as e:
@@ -520,6 +675,25 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
 
             # BadRequest lain — retry sekali, mungkin transient
             logger.warning(f"[LIVE] Order attempt {attempt} BadRequest: {e}")
+
+        except ccxt.InvalidOrder as e:
+            err_str = str(e)
+            # 110017 = "current position is zero, cannot fix reduce-only order qty"
+            # → Bot lokal state desync: kira ada posisi, exchange bilang zero.
+            #   Retry sia-sia karena state lokal gak berubah sampai PnL sync next cycle (~2s).
+            #   Bug ke-detect saat smoke test demo 2026-05-29 — spam 3x retry tanpa hasil.
+            if "110017" in err_str or "current position is zero" in err_str.lower():
+                logger.warning(
+                    f"[LIVE] Order rejected: position di exchange sudah zero (110017). "
+                    f"Local state desync — clear optimistic + PnL sync reconcile. Tidak retry."
+                )
+                # Exchange konfirmasi posisi zero → clear state lokal sekarang juga,
+                # supaya strategy tidak terus evaluasi posisi hantu sampai sync jalan.
+                position_manager.clear_position_optimistic()
+                return {"status": "rejected", "reason": "Position desync: exchange shows zero — handled by sync"}
+            # InvalidOrder lain (110010 leverage not modified, dll) — config issue, no retry
+            logger.error(f"[LIVE] FATAL: InvalidOrder — tidak retry: {e}")
+            return {"status": "rejected", "reason": f"InvalidOrder: {err_str[:100]}"}
 
         except ccxt.RateLimitExceeded as e:
             # CCXT auto-throttle sudah on (enableRateLimit=True), kalau masih kena
@@ -578,14 +752,36 @@ def place_order(signal: Signal) -> None:
         except RuntimeError:
             asyncio.run(coro_paper)
     else:
-        coro_live = _live_place_order_async(signal)
+        global _live_order_in_flight
+        # Duplicate-fire guard: selama 1 order live masih in-flight (belum konfirmasi
+        # + state belum ke-update), JANGAN dispatch order baru. Tanpa ini, tick 100ms
+        # berikutnya masih lihat state lama → kirim order kembar (bug 2026-05-29).
+        if _live_order_in_flight:
+            logger.warning(
+                f"[LIVE] Order {action} di-skip — order sebelumnya masih in-flight. "
+                f"Mencegah duplicate fire (state belum sync)."
+            )
+            return
+
+        # _live_place_order_async returns OrderResult; wrap in a None-returning coroutine
+        # dan reset flag in-flight di finally (sukses, gagal, maupun exception).
+        async def _fire_live(s: Signal = signal) -> None:
+            global _live_order_in_flight
+            try:
+                await _live_place_order_async(s)
+            finally:
+                _live_order_in_flight = False
+
         try:
             loop = asyncio.get_running_loop()
-            # _live_place_order_async returns OrderResult; wrap in a None-returning coroutine
-            async def _fire_live(s: Signal = signal) -> None:
-                await _live_place_order_async(s)
+            _live_order_in_flight = True
             task_live: asyncio.Task[None] = loop.create_task(_fire_live())
             _background_tasks.add(task_live)
             task_live.add_done_callback(_background_tasks.discard)
         except RuntimeError:
-            asyncio.run(coro_live)
+            # Tidak ada event loop berjalan (mis. unit test / sync context) — jalankan inline.
+            _live_order_in_flight = True
+            try:
+                asyncio.run(_live_place_order_async(signal))
+            finally:
+                _live_order_in_flight = False

@@ -23,7 +23,7 @@ from __future__ import annotations
 import time
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Literal, Union, cast
 from config import INITIAL_BALANCE, MODE, SYMBOL, PNL_SYNC_INTERVAL
 from ccxt_client import exchange
 import ccxt_client
@@ -125,6 +125,60 @@ def close_position(exit_price: float, exit_fee: float = 0.0) -> tuple[float, flo
     return net_pnl, exit_fee
 
 
+# =============================================================================
+# OPTIMISTIC LOCAL STATE (demo/live) — tutup race window sebelum _sync_position
+# =============================================================================
+# Di mode demo/live, _state hanya di-update tiap PNL_SYNC_INTERVAL detik oleh
+# start_pnl_sync_loop(). execution._live_place_order_async() TIDAK menyentuh
+# state (beda dari paper mode yang panggil open_position/close_position langsung).
+# Akibatnya ada window (sampai ~PNL_SYNC_INTERVAL detik) di mana strategy tick
+# berikutnya masih lihat side="none" walaupun order sudah ter-fill → bot kirim
+# order DUPLIKAT (bug ke-detect smoke test demo 2026-05-29).
+#
+# Dua fungsi di bawah dipanggil execution.py SETELAH fill terkonfirmasi untuk
+# update HANYA field posisi (side/entry/qty) secara optimistic. Akunting uang
+# (balance, realized_pnl_total, total_fees) tetap MILIK sync loop dari data
+# exchange yang authoritative — sengaja TIDAK disentuh di sini supaya tidak
+# double-count. _sync_position() merekonsiliasi entry_price & qty exact nanti.
+def set_position_optimistic(side: str, entry_price: float, qty: float) -> None:
+    """
+    Demo/live only: catat posisi baru secara optimistic setelah fill konfirmasi,
+    tanpa mengubah balance/pnl/fee (itu domain sync loop).
+
+    Idempotent terhadap sync: kalau _sync_position sudah update state lebih dulu,
+    pemanggilan ini hanya menimpa field posisi dengan nilai yang konsisten.
+    """
+    _state["side"] = side
+    _state["entry_price"] = entry_price
+    _state["qty"] = qty
+    _state["unrealized_pnl"] = 0.0  # baru di-fill @ entry → unrealized ~0; sync recompute
+    if _state["open_time"] is None:
+        _state["open_time"] = time.time()
+    logger.info(
+        f"[OPTIMISTIC] Position set: {side.upper()} {qty} @ {entry_price} "
+        f"(sync akan verifikasi state ke exchange)"
+    )
+
+
+def clear_position_optimistic() -> None:
+    """
+    Demo/live only: bersihkan posisi secara optimistic setelah close fill penuh
+    terkonfirmasi (atau saat exchange konfirmasi posisi sudah zero, mis. reject
+    110017). Tidak menyentuh balance/realized_pnl — sync loop yang catat PnL
+    realized dari data exchange.
+    """
+    if _state["side"] == "none":
+        return  # sudah bersih (mungkin sync sudah keburu jalan)
+    logger.info(
+        f"[OPTIMISTIC] Position cleared (was {_state['side']}) — sync akan verifikasi"
+    )
+    _state["side"] = "none"
+    _state["entry_price"] = 0.0
+    _state["qty"] = 0.0
+    _state["unrealized_pnl"] = 0.0
+    _state["open_time"] = None
+
+
 _last_equity_log_time: float = 0.0
 
 # =============================================================================
@@ -170,36 +224,217 @@ def update_pnl(bid_price: float, ask_price: float) -> None:
 # =============================================================================
 # BYBIT PNL SYNC LOOP (demo / live mode)
 # =============================================================================
+# Konstanta untuk tracking sync health
+SYNC_FAIL_WARN_THRESHOLD: int = 3   # log error setelah N kali gagal berturut
+
+# Counter konsekutif failure (state visible untuk dashboard nanti)
+_consecutive_position_sync_failures: int = 0
+_consecutive_balance_sync_failures: int = 0
+
+
+# Parser output: 3 outcomes mutually exclusive.
+# Pure function — pisahkan parsing dari side-effect supaya unit-testable.
+ParsedPositionUpdate = tuple[
+    Literal["update"],
+    tuple[Literal["long", "short"], float, float, float],  # side, entry, qty, unrealized
+]
+ParsedPositionClear = tuple[Literal["clear"], None]
+ParsedPositionSkip = tuple[Literal["skip"], str]  # reason
+ParsedPositionResult = Union[ParsedPositionUpdate, ParsedPositionClear, ParsedPositionSkip]
+
+
+def _parse_position_response(positions: list) -> ParsedPositionResult:
+    """
+    Parse CCXT fetch_positions response — validate sebelum overwrite state lokal.
+
+    Return value (status, payload):
+      ("clear", None)
+          Tidak ada posisi aktif di exchange — caller harus reset state ke none.
+      ("update", (side, entry_price, qty, unrealized_pnl))
+          Posisi valid — caller harus overwrite state secara atomic.
+      ("skip", reason)
+          Data exchange invalid/incomplete — caller TIDAK BOLEH ubah state lokal
+          (mencegah corruption seperti qty>0 + entry_price=0 yang bikin PnL infinite).
+    """
+    # Kumpulkan posisi yang punya 'contracts' valid > 0.
+    # Skip record dengan contracts None/non-numeric (incomplete dari API).
+    active: list[dict] = []
+    for p in positions:
+        if not isinstance(p, dict):
+            continue
+        contracts_raw: Any = p.get("contracts")
+        if contracts_raw is None:
+            continue
+        try:
+            contracts_val: float = float(contracts_raw)
+        except (TypeError, ValueError):
+            continue
+        if contracts_val > 0:
+            active.append(p)
+
+    if not active:
+        return ("clear", None)
+
+    # Take first active position (kita asumsi 1-symbol-1-side; untuk hedge mode
+    # multi-sided perlu logic terpisah — di luar scope).
+    pos: dict = active[0]
+    side_raw: str = str(pos.get("side", "")).lower()
+    if side_raw not in ("long", "short"):
+        return ("skip", f"Invalid 'side'={side_raw!r} on active position")
+
+    # Validasi entryPrice WAJIB ada — kalau missing/None, state lama lebih aman
+    # daripada entry_price=0 yang bikin PnL calc rusak total.
+    entry_raw: Any = pos.get("entryPrice")
+    if entry_raw is None:
+        return ("skip", "Active position missing 'entryPrice' field — keeping previous state")
+    try:
+        entry_price: float = float(entry_raw)
+    except (TypeError, ValueError):
+        return ("skip", f"'entryPrice' not numeric: {entry_raw!r}")
+    if entry_price <= 0:
+        return ("skip", f"'entryPrice'={entry_price} not positive")
+
+    # contracts sudah divalidasi di filter di atas
+    contracts_raw = pos.get("contracts")
+    try:
+        qty: float = float(contracts_raw)
+    except (TypeError, ValueError):
+        return ("skip", f"'contracts' not numeric: {contracts_raw!r}")
+    if qty <= 0:
+        return ("skip", f"'contracts'={qty} not positive")
+
+    # unrealizedPnl optional — default 0 kalau tidak ada / invalid (cosmetic field)
+    unrealized_raw: Any = pos.get("unrealizedPnl")
+    try:
+        unrealized: float = float(unrealized_raw) if unrealized_raw is not None else 0.0
+    except (TypeError, ValueError):
+        unrealized = 0.0
+
+    side_lit: Literal["long", "short"] = "long" if side_raw == "long" else "short"
+    return ("update", (side_lit, entry_price, qty, unrealized))
+
+
+# Parser balance: distinguish "tidak ada field" (skip) vs "field = 0" (update).
+# Bug lama: `usdt.get("total") or _state["balance"]` membuat balance=0 (user kehabisan
+# modal) jatuh ke balance lama → loss tersembunyi.
+ParsedBalanceUpdate = tuple[Literal["update"], float]
+ParsedBalanceSkip = tuple[Literal["skip"], str]
+ParsedBalanceResult = Union[ParsedBalanceUpdate, ParsedBalanceSkip]
+
+
+def _parse_balance_response(balance: dict) -> ParsedBalanceResult:
+    """
+    Parse CCXT fetch_balance response — distinguish missing field vs explicit 0.
+
+    Bug yang di-prevent: `float(usdt.get("total") or fallback)` membuat balance=0
+    (user habis margin) jatuh ke fallback → kerugian tersembunyi dari dashboard.
+    """
+    if not isinstance(balance, dict):
+        return ("skip", f"balance response bukan dict: {type(balance).__name__}")
+
+    usdt: Any = balance.get("USDT")
+    if not isinstance(usdt, dict):
+        return ("skip", "USDT entry missing in balance response")
+
+    total_raw: Any = usdt.get("total")
+    if total_raw is None:
+        return ("skip", "'total' field missing in USDT balance")
+
+    try:
+        total: float = float(total_raw)
+    except (TypeError, ValueError):
+        return ("skip", f"'total' not numeric: {total_raw!r}")
+
+    if total < 0:
+        # Balance negatif tidak masuk akal (margin call?) — minta investigasi manual
+        return ("skip", f"'total'={total} negative (margin call?), not updating state")
+
+    return ("update", total)
+
+
 async def _sync_position() -> None:
-    """Fetch open position dari Bybit via CCXT dan update local state."""
+    """
+    Fetch open position dari Bybit via CCXT dan update local state.
+
+    Error policy:
+      - API/network error  → state TIDAK disentuh, counter naik, log warning,
+                              eskalasi ke error log kalau > SYNC_FAIL_WARN_THRESHOLD
+      - Response invalid    → state TIDAK disentuh, log error (data quality)
+      - No active position  → clear state ke none
+      - Valid active        → atomic update semua field sekaligus
+    """
+    global _consecutive_position_sync_failures
     try:
         positions = await exchange.fetch_positions([ccxt_client.CCXT_SYMBOL])
-        # CCXT returns list; filter posisi aktif (contracts > 0)
-        active = [p for p in positions if float(p.get("contracts") or 0) > 0]
-        if active:
-            pos = active[0]
-            side_raw: str = str(pos.get("side", "")).lower()  # "long" or "short"
-            _state["side"] = side_raw if side_raw in ("long", "short") else "none"
-            _state["entry_price"] = float(pos.get("entryPrice") or 0)
-            _state["qty"]         = float(pos.get("contracts") or 0)
-            _state["unrealized_pnl"] = float(pos.get("unrealizedPnl") or 0)
-        else:
-            _state["side"]           = "none"
-            _state["qty"]            = 0.0
-            _state["unrealized_pnl"] = 0.0
     except Exception as e:
-        logger.warning(f"[PNL SYNC] Position fetch error: {e}")
+        _consecutive_position_sync_failures += 1
+        msg = (f"[PNL SYNC] Position fetch failed (#{_consecutive_position_sync_failures}): "
+               f"{type(e).__name__}: {e}. State NOT updated — keeping previous values.")
+        if _consecutive_position_sync_failures >= SYNC_FAIL_WARN_THRESHOLD:
+            logger.error(msg + " Check connectivity/auth — local view may be stale.")
+        else:
+            logger.warning(msg)
+        return
+
+    if not isinstance(positions, list):
+        logger.error(f"[PNL SYNC] fetch_positions() returned {type(positions).__name__}, expected list. State unchanged.")
+        return
+
+    status, payload = _parse_position_response(positions)
+
+    if status == "skip":
+        logger.error(f"[PNL SYNC] Position response invalid: {payload}. State unchanged.")
+        return
+
+    if status == "clear":
+        # Reset semua field posisi (termasuk entry_price yang sebelumnya tidak di-clear).
+        if _state["side"] != "none":
+            logger.info("[PNL SYNC] No open position at exchange — clearing local state.")
+        _state["side"]           = "none"
+        _state["entry_price"]    = 0.0
+        _state["qty"]            = 0.0
+        _state["unrealized_pnl"] = 0.0
+        _consecutive_position_sync_failures = 0
+        return
+
+    # status == "update" — cast karena pyright tidak narrow union dari status check
+    update_tuple = cast("tuple[Literal['long', 'short'], float, float, float]", payload)
+    side_lit, entry_price, qty, unrealized = update_tuple
+    _state["side"]           = side_lit
+    _state["entry_price"]    = entry_price
+    _state["qty"]            = qty
+    _state["unrealized_pnl"] = unrealized
+    _consecutive_position_sync_failures = 0
 
 
 async def _sync_balance() -> None:
-    """Fetch wallet balance dari Bybit via CCXT dan update local state."""
+    """
+    Fetch wallet balance dari Bybit via CCXT dan update local state.
+
+    Error policy sama dengan _sync_position — API error tidak overwrite,
+    response 0 yang valid dipakai apa adanya (jangan disembunyikan).
+    """
+    global _consecutive_balance_sync_failures
     try:
         balance = await exchange.fetch_balance()
-        usdt = balance.get("USDT", {})
-        wallet = float(usdt.get("total") or _state["balance"])
-        _state["balance"] = wallet
     except Exception as e:
-        logger.warning(f"[PNL SYNC] Balance fetch error: {e}")
+        _consecutive_balance_sync_failures += 1
+        msg = (f"[PNL SYNC] Balance fetch failed (#{_consecutive_balance_sync_failures}): "
+               f"{type(e).__name__}: {e}. Keeping previous balance.")
+        if _consecutive_balance_sync_failures >= SYNC_FAIL_WARN_THRESHOLD:
+            logger.error(msg + " Check connectivity/auth.")
+        else:
+            logger.warning(msg)
+        return
+
+    status, payload = _parse_balance_response(balance)
+    if status == "skip":
+        logger.error(f"[PNL SYNC] Balance response invalid: {payload}. State unchanged.")
+        return
+
+    # status == "update" — termasuk total=0 (user habis margin) dipakai apa adanya
+    _state["balance"] = cast(float, payload)
+    _consecutive_balance_sync_failures = 0
 
 
 async def start_pnl_sync_loop() -> None:
