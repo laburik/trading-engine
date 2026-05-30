@@ -25,6 +25,8 @@ heartbeat.json
 bot_health.json
 bot_pid.txt
 *.log
+logs/
+
 
 # ─── MODEL ML (file besar, opsional di-push) ──────────────────────────────────
 # Uncomment baris di bawah jika TIDAK ingin push model ML ke GitHub
