@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import pandas as pd
 import numpy as np
 import joblib
@@ -11,6 +12,8 @@ import types as _types
 from typing import Any, Optional
 
 from ft_types import BotState, MarketDataSnapshot, Signal
+
+logger = logging.getLogger("strategy_ml")
 
 # ==========================================
 # 1. INISIALISASI MODEL ML & SCALER (OPSIONAL)
@@ -49,6 +52,25 @@ scaler = _ml_cache.scaler
 
 # Flag untuk dipakai di generate_signal()
 ML_ENABLED: bool = (model is not None and scaler is not None)
+
+# Permanent-disable flag: kalau ML inference gagal struktural (shape mismatch,
+# model corrupt), set flag ini supaya tick berikutnya langsung skip ML — tidak
+# loop error tiap 100ms. Hanya bisa di-reset dengan restart proses + perbaikan.
+_ML_PERMANENTLY_DISABLED: bool = False
+_ML_DISABLE_REASON: str = ""
+
+
+def _disable_ml_permanently(reason: str) -> None:
+    """Matikan ML untuk sisa sesi ini. Bot lanjut jalan, tapi entry signal disetop."""
+    global _ML_PERMANENTLY_DISABLED, _ML_DISABLE_REASON
+    if not _ML_PERMANENTLY_DISABLED:
+        _ML_PERMANENTLY_DISABLED = True
+        _ML_DISABLE_REASON = reason
+        logger.critical(
+            f"ML dinonaktifkan permanen sesi ini: {reason}. "
+            f"Bot tidak akan generate entry signal lagi sampai restart + perbaikan model/scaler."
+        )
+
 
 # ==========================================
 # 2. STATE MANAGER (UNTUK TRIPLE BARRIER)
@@ -168,18 +190,31 @@ def generate_signal(data: MarketDataSnapshot) -> Signal:
     # ---------------------------------------------------------
     # B. LOGIKA MASUK (ENTRY: MACHINE LEARNING & FEATURE ENGINEERING)
     # ---------------------------------------------------------
+    # Pre-flight guards (no try/except needed — pure boolean checks).
+    if _ML_PERMANENTLY_DISABLED:
+        return {"action": "hold", "reason": f"ML nonaktif sesi ini: {_ML_DISABLE_REASON}"}
+
+    if not ML_ENABLED:
+        # File .pkl tidak ditemukan saat startup — pure indicator mode.
+        # NEW-03 FIX (preserved): kembalikan hold tanpa trigger error counter di dashboard.
+        return {"action": "hold", "reason": "ML tidak aktif (file .pkl tidak ditemukan)"}
+
+    fitur_wajib: list[str] = [
+        'volume', 'return', 'return_lag_1', 'volume_lag_1',
+        'return_lag_3', 'volume_lag_3', 'return_lag_5', 'volume_lag_5',
+        'vol_ma_20', 'vol_surge_ratio', 'RSI_14', 'MACD'
+    ]
+
+    # Cache key: (jumlah candle, open_time candle terakhir).
+    # Jika candle belum berubah sejak tick lalu, skip seluruh feature engineering.
+    _last_open_time = candles_list[-1].get("open_time", 0) if isinstance(candles_list[-1], dict) else 0
+    _cache_key = (len(candles_list), _last_open_time)
+
+    # -------- BLOK 1: Feature Engineering (recoverable errors) --------
+    # KeyError = kolom candle missing (data upstream belum lengkap) → transient
+    # ValueError/TypeError = math fail di pandas (mis. division on empty) → transient
+    # Keduanya retry-able di tick berikutnya — tidak disable ML.
     try:
-        fitur_wajib: list[str] = [
-            'volume', 'return', 'return_lag_1', 'volume_lag_1',
-            'return_lag_3', 'volume_lag_3', 'return_lag_5', 'volume_lag_5',
-            'vol_ma_20', 'vol_surge_ratio', 'RSI_14', 'MACD'
-        ]
-
-        # Cache key: (jumlah candle, open_time candle terakhir)
-        # Jika candle belum berubah sejak tick lalu, skip seluruh feature engineering
-        _last_open_time = candles_list[-1].get("open_time", 0) if isinstance(candles_list[-1], dict) else 0
-        _cache_key = (len(candles_list), _last_open_time)
-
         if _feat_cache["key"] == _cache_key and _feat_cache["baris_terbaru"] is not None:
             baris_terbaru: pd.DataFrame = _feat_cache["baris_terbaru"]
         else:
@@ -210,44 +245,55 @@ def generate_signal(data: MarketDataSnapshot) -> Signal:
 
             _feat_cache["key"] = _cache_key
             _feat_cache["baris_terbaru"] = baris_terbaru
+    except KeyError as e:
+        logger.warning(f"Feature engineering: kolom candle missing: {e}")
+        return {"action": "hold", "reason": f"Kolom candle missing: {e}"}
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Feature engineering {type(e).__name__}: {e}")
+        return {"action": "hold", "reason": f"Hitung indikator gagal: {type(e).__name__}"}
 
-        # 5. Transformasi Data dengan Scaler dan Prediksi Model
-        # NEW-03 FIX: Cek ML_ENABLED sebelum akses scaler/model.
-        # Tanpa guard ini, jika .pkl tidak ada (ML disabled), setiap tick masuk except
-        # → bot_monitor consecutive_errors naik terus → dashboard selalu merah "ERROR"
-        # padahal bot berjalan normal dalam pure-indicator mode.
-        if not ML_ENABLED:
-            return {"action": "hold", "reason": "ML tidak aktif (file .pkl tidak ditemukan), gunakan pure indicator mode"}
-
+    # -------- BLOK 2: ML Inference (permanent errors disable ML) --------
+    # ValueError dari scaler/model = shape mismatch atau NaN input — structural,
+    #   tidak akan recover dengan retry. Disable ML supaya bot tidak loop error.
+    # AttributeError = model/scaler corrupt object (mis. pkl version mismatch).
+    # Exception lain = unknown, log full stack tapi belum disable (bisa jadi transient).
+    try:
         data_scaled = scaler.transform(baris_terbaru)
         proba: np.ndarray = model.predict_proba(data_scaled)[0]  # [prob_turun, prob_naik]
         probabilitas_naik: float  = float(proba[1])
         probabilitas_turun: float = float(proba[0])  # BUG-04 FIX: tambah probabilitas turun untuk sinyal short
-
-        # 6. Evaluasi Trigger Entry
-        if probabilitas_naik > 0.60:
-            bot_state["in_position"] = True
-            bot_state["side"]        = "long"   # BUG-04 FIX: simpan side
-            bot_state["entry_price"] = current_ask  # Catat harga saat beli
-            bot_state["entry_time"]  = current_time  # Catat waktu untuk Time Stop
-            return {
-                "action": "buy",
-                "reason": f"Sinyal RF ML Prob Naik > 60% (Skor: {probabilitas_naik:.2f})"
-            }
-
-        # BUG-04 FIX: Sinyal SELL/SHORT saat probabilitas turun > 60%
-        if probabilitas_turun > 0.60:
-            bot_state["in_position"] = True
-            bot_state["side"]        = "short"  # simpan side short
-            bot_state["entry_price"] = current_bid  # Catat harga saat jual
-            bot_state["entry_time"]  = current_time
-            return {
-                "action": "sell",
-                "reason": f"Sinyal RF ML Prob Turun > 60% (Skor: {probabilitas_turun:.2f})"
-            }
-
+    except ValueError as e:
+        _disable_ml_permanently(f"scaler/model ValueError (shape/NaN): {e}")
+        return {"action": "hold", "reason": "ML fatal: shape mismatch atau NaN input — ML disabled"}
+    except AttributeError as e:
+        _disable_ml_permanently(f"scaler/model AttributeError (corrupt): {e}")
+        return {"action": "hold", "reason": "ML fatal: model/scaler corrupt — ML disabled"}
     except Exception as e:
-        return {"action": "hold", "reason": f"Error Eksekusi ML: {str(e)}"}
+        # Unknown — log stack trace, return hold (don't disable, mungkin transient)
+        logger.error(f"ML inference error {type(e).__name__}: {e}", exc_info=True)
+        return {"action": "hold", "reason": f"ML transient error: {type(e).__name__}"}
+
+    # -------- BLOK 3: Trigger Entry (no error handling needed — pure logic) --------
+    if probabilitas_naik > 0.60:
+        bot_state["in_position"] = True
+        bot_state["side"]        = "long"   # BUG-04 FIX: simpan side
+        bot_state["entry_price"] = current_ask  # Catat harga saat beli
+        bot_state["entry_time"]  = current_time  # Catat waktu untuk Time Stop
+        return {
+            "action": "buy",
+            "reason": f"Sinyal RF ML Prob Naik > 60% (Skor: {probabilitas_naik:.2f})"
+        }
+
+    # BUG-04 FIX: Sinyal SELL/SHORT saat probabilitas turun > 60%
+    if probabilitas_turun > 0.60:
+        bot_state["in_position"] = True
+        bot_state["side"]        = "short"  # simpan side short
+        bot_state["entry_price"] = current_bid  # Catat harga saat jual
+        bot_state["entry_time"]  = current_time
+        return {
+            "action": "sell",
+            "reason": f"Sinyal RF ML Prob Turun > 60% (Skor: {probabilitas_turun:.2f})"
+        }
 
     return {"action": "hold", "reason": "Tidak ada sinyal, probabilitas <= 60%"}
 

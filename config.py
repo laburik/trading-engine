@@ -48,15 +48,15 @@ CATEGORY = "linear"  # "linear" for USDT-perp, "inverse" for coin-margined
 #             - exchange lain: testnet (data testnet + fill testnet) — kurang realistis
 #                              karena harga testnet bisa drift dari market real
 # "live"  = Live API, uang nyata (perlu API_KEY)
-MODE = "paper"
+MODE = "demo"
 
 # --- Account ---
 INITIAL_BALANCE = 1000.0       # Paper trading starting balance (USDT)
-LEVERAGE = 10                  # Leverage multiplier
-ORDER_SIZE_USDT = 5         # Size per trade in USDT (before leverage)
+LEVERAGE = 3                  # Leverage multiplier
+ORDER_SIZE_USDT = 2        # Size per trade in USDT (before leverage)
 
 # --- Execution ---
-SLIPPAGE_TOLERANCE = 0.0005    # 0.05% max slippage tolerance
+SLIPPAGE_TOLERANCE = 0.0001    # 0.05% max slippage tolerance
 MAX_RETRY = 3                  # Max order retry attempts
 RETRY_DELAY_MS = 20           # Delay between retries in milliseconds
 CANCEL_ON_PARTIAL = False      # True = cancel remainder on partial fill

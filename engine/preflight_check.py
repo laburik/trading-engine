@@ -88,7 +88,9 @@ def validate_strategy() -> tuple[list[str], list[str]]:
     """
     errors   = []
     warnings = []
-    root   = os.path.dirname(os.path.abspath(__file__))
+    # preflight_check.py ada di engine/, strategy.py ada di project root.
+    # Naik 1 level dari dirname(__file__) supaya ketemu strategy.py user.
+    root   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     fpath  = os.path.join(root, "strategy.py")
 
     # ------------------------------------------------------------------
@@ -207,7 +209,7 @@ def validate_strategy() -> tuple[list[str], list[str]]:
             f"   Periksa logika di strategy.py.\n"
             f"   Traceback:\n{tb}"
         )
-        return errors
+        return errors, warnings
 
     # ------------------------------------------------------------------
     # LANGKAH 6: Validasi FORMAT return value
@@ -222,7 +224,7 @@ def validate_strategy() -> tuple[list[str], list[str]]:
             f"   Tapi menerima: {type(result).__name__} = {result!r}\n"
             f"   Contoh yang benar: return {{\"action\": \"hold\", \"reason\": \"...\"}}"
         )
-        return errors
+        return errors, warnings
 
     if "action" not in result:
         errors.append(
@@ -230,7 +232,7 @@ def validate_strategy() -> tuple[list[str], list[str]]:
             f"   Tapi yang diterima: {result!r}\n"
             f"   Contoh yang benar: return {{\"action\": \"hold\", \"reason\": \"...\"}}"
         )
-        return errors
+        return errors, warnings
 
     action_val = result.get("action")
     if action_val not in VALID_ACTIONS:
@@ -239,7 +241,7 @@ def validate_strategy() -> tuple[list[str], list[str]]:
             f"   Nilai yang diizinkan: {sorted(VALID_ACTIONS)}\n"
             f"   Pastikan generate_signal() return salah satu dari nilai tersebut."
         )
-        return errors
+        return errors, warnings
 
     # ------------------------------------------------------------------
     # LANGKAH 7: on_tick() OPSIONAL (mode advanced)

@@ -15,7 +15,7 @@ import asyncio
 import json
 import time
 import logging
-from typing import Optional
+from typing import Any, Optional
 from collections import deque
 from sortedcontainers import SortedDict
 from config import (
@@ -51,11 +51,21 @@ funding_rate: FundingRateState = {"value": 0.0, "next_funding_time": 0, "predict
 # Latest best bid/ask (updated from orderbook stream)
 best_bid: BidAskLevel = {"price": 0.0, "qty": 0.0}
 best_ask: BidAskLevel = {"price": 0.0, "qty": 0.0}
-# Unix timestamp saat best_bid/best_ask terakhir di-update.
-# Dipakai execution._check_stale_data() untuk reject order kalau WS disconnect
-# dan data jadi basi (mencegah eksekusi pakai harga lama saat reconnect).
+# Unix timestamp saat best_bid/best_ask terakhir di-update (ts_init = waktu KITA
+# terima/proses). Dipakai execution._check_stale_data() untuk reject order kalau WS
+# disconnect dan data jadi basi (mencegah eksekusi pakai harga lama saat reconnect).
 best_bid_updated_at: float = 0.0
 best_ask_updated_at: float = 0.0
+
+# Waktu EVENT dari exchange (ts_event, detik) — dari field `timestamp` pesan WS.
+# Pola ala Nautilus (dua timestamp): ts_event = kapan kejadian di exchange,
+# ts_init (*_updated_at di atas) = kapan kita terima. Gunanya:
+#   - latency feed = ts_init - ts_event (lihat data_latency_ms())
+#   - deteksi feed "lag parah" (pesan masuk tapi isinya tua) yang luput dari
+#     cek waktu-terima — lihat execution._check_stale_data().
+# 0.0 = exchange tidak menyertakan timestamp (cek berbasis ts_event dilewati).
+best_bid_ts_event: float = 0.0
+best_ask_ts_event: float = 0.0
 last_prices: dict[str, float] = {}  # Injected for real-time dashboard display per timeframe
 
 # Orderbook snapshot (SortedDict keyed by price level → qty)
@@ -111,9 +121,16 @@ async def _funding_rate_loop() -> None:
 # =============================================================================
 # ORDERBOOK PROCESSING (CCXT Pro — snapshot + delta merge ditangani internal)
 # =============================================================================
-def _update_best_bid_ask() -> None:
-    """Recalculate best bid and best ask from snapshot."""
-    global best_bid_updated_at, best_ask_updated_at
+def _update_best_bid_ask(event_ts: float = 0.0) -> None:
+    """
+    Recalculate best bid and best ask from snapshot.
+
+    Args:
+        event_ts: timestamp EVENT dari exchange (detik). 0.0 kalau exchange tidak
+                  menyertakannya. Disimpan sebagai ts_event; waktu terima (ts_init)
+                  diambil dari time.time() di sini.
+    """
+    global best_bid_updated_at, best_ask_updated_at, best_bid_ts_event, best_ask_ts_event
     bids: SortedDict = orderbook_snapshot["bids"]
     asks: SortedDict = orderbook_snapshot["asks"]
 
@@ -122,13 +139,25 @@ def _update_best_bid_ask() -> None:
         best_price, qty = bids.peekitem(-1)
         best_bid["price"] = best_price
         best_bid["qty"] = qty
-        best_bid_updated_at = now
+        best_bid_updated_at = now        # ts_init — waktu kita terima
+        best_bid_ts_event = event_ts     # ts_event — waktu kejadian di exchange
 
     if asks:
         best_price, qty = asks.peekitem(0)
         best_ask["price"] = best_price
         best_ask["qty"] = qty
         best_ask_updated_at = now
+        best_ask_ts_event = event_ts
+
+
+def data_latency_ms() -> Optional[float]:
+    """
+    Latensi feed best_bid = ts_init - ts_event (milidetik). None kalau ts_event
+    tidak tersedia. Latensi yang konsisten besar = clock skew atau feed lag.
+    """
+    if best_bid_ts_event <= 0.0 or best_bid_updated_at <= 0.0:
+        return None
+    return (best_bid_updated_at - best_bid_ts_event) * 1000.0
 
 
 def _process_ccxt_orderbook(ob: dict) -> None:
@@ -150,7 +179,14 @@ def _process_ccxt_orderbook(ob: dict) -> None:
         if float(qty) > 0:
             orderbook_snapshot["asks"][float(price)] = float(qty)
 
-    _update_best_bid_ask()
+    # ob["timestamp"] = waktu event di exchange (ms). Bisa None untuk sebagian
+    # exchange/kondisi — kalau begitu event_ts=0.0 (cek ts_event dilewati).
+    ts_ms: Any = ob.get("timestamp")
+    try:
+        event_ts: float = float(ts_ms) / 1000.0 if ts_ms else 0.0
+    except (TypeError, ValueError):
+        event_ts = 0.0
+    _update_best_bid_ask(event_ts)
 
     # Push ke buffer (format identik dengan versi lama)
     snapshot_copy: OrderbookSnapshot = {

@@ -39,8 +39,24 @@ exchange = _ExchangeClass({
 #   - Lain   → pakai testnet via set_sandbox_mode(True) (data testnet, kurang akurat)
 if MODE == "demo":
     if EXCHANGE == "bybit":
+        # Bybit Demo Trading. CCXT versi baru punya helper khusus yang handle
+        # REST URL + WebSocket URL sekaligus — pakai itu kalau ada.
+        # Fallback untuk CCXT versi lama: patch URL REST tanpa replace whole
+        # dict (supaya kunci WebSocket 'ws', 'public', dll tetap aman).
         exchange.set_sandbox_mode(False)
-        exchange.hostname = "api-demo.bybit.com"
+        if hasattr(exchange, "enable_demo_trading"):
+            exchange.enable_demo_trading(True)
+        else:
+            api_urls = exchange.urls.get("api", {})
+            if isinstance(api_urls, dict):
+                api_urls["public"]  = "https://api-demo.bybit.com"
+                api_urls["private"] = "https://api-demo.bybit.com"
+                exchange.urls["api"] = api_urls
+            logger.warning(
+                "[CCXT] enable_demo_trading() tidak tersedia di versi CCXT ini. "
+                "REST diarahkan ke api-demo, tapi WebSocket mungkin tetap ke live. "
+                "Upgrade CCXT: pip install --upgrade ccxt"
+            )
     else:
         try:
             exchange.set_sandbox_mode(True)
@@ -84,8 +100,18 @@ async def init_exchange() -> None:
     try:
         await exchange.load_markets()
         market_info = exchange.markets_by_id.get(SYMBOL)
+        # Beberapa exchange (terutama Bybit) punya 1 raw symbol "XRPUSDT" yang
+        # mapping ke 2 market unified: spot (XRP/USDT) DAN perpetual (XRP/USDT:USDT).
+        # Bot ini config untuk perpetual (defaultType=linear, fetch_funding_rate, dll),
+        # jadi WAJIB pilih yang swap+linear. Tanpa filter, kadang yang ke-pick spot
+        # → fetchFundingRate gagal & order routing salah.
         if isinstance(market_info, list):
-            market_info = market_info[0]
+            picked = None
+            for m in market_info:
+                if isinstance(m, dict) and m.get("swap") and m.get("linear"):
+                    picked = m
+                    break
+            market_info = picked or market_info[0]
         if market_info:
             _ccxt_symbol = market_info["symbol"]
             CCXT_SYMBOL  = _ccxt_symbol
