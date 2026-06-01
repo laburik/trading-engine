@@ -223,6 +223,13 @@ def _analyze_snaps(snaps: list[dict]) -> dict:
             side = pos[0].get("side")
         series.append({"contracts": total_c, "price": price, "side": side})
 
+    # Harga acuan global untuk hitung "1 order normal" — pakai harga non-zero TERAKHIR.
+    # Robust terhadap transient entryPrice=None di satu snapshot (yang sebelumnya bikin
+    # "1 order normal ~0.0000"). Selama bot pernah punya posisi dgn harga valid, acuan ada.
+    nonzero_prices = [pt["price"] for pt in series if pt["price"] > 1e-9]
+    ref_price = nonzero_prices[-1] if nonzero_prices else 0.0
+    expected_single = _expected_single_qty(ref_price)
+
     # Bangun episode
     episodes: list[dict] = []
     cur: dict | None = None
@@ -232,9 +239,13 @@ def _analyze_snaps(snaps: list[dict]) -> dict:
             if cur is None:
                 cur = {"max_contracts": pt["contracts"], "price": pt["price"],
                        "side": pt["side"], "started_flat": seen_flat}
-            elif pt["contracts"] > cur["max_contracts"]:
-                cur["max_contracts"] = pt["contracts"]
-                cur["price"] = pt["price"] or cur["price"]
+            else:
+                if pt["contracts"] > cur["max_contracts"]:
+                    cur["max_contracts"] = pt["contracts"]
+            # Tangkap harga valid kapan pun muncul (jangan nyangkut di transient null
+            # yg kebetulan ada di snapshot pertama episode).
+            if cur["price"] <= 1e-9 and pt["price"] > 1e-9:
+                cur["price"] = pt["price"]
         else:
             seen_flat = True
             if cur is not None:
@@ -246,12 +257,13 @@ def _analyze_snaps(snaps: list[dict]) -> dict:
     new_episodes = [e for e in episodes if e["started_flat"]]      # dibuka saat observasi
     preexisting = [e for e in episodes if not e["started_flat"]]   # leftover run lama
 
-    # Stacking hanya dinilai untuk episode baru
+    # Stacking hanya dinilai untuk episode baru. Pakai harga episode; kalau transient
+    # null (0), fallback ke harga acuan global agar ratio tetap terhitung.
     worst_ratio = 0.0
     stack_new = 0
     worst_ep = None
     for e in new_episodes:
-        exp = _expected_single_qty(e["price"])
+        exp = _expected_single_qty(e["price"]) or expected_single
         r = (e["max_contracts"] / exp) if exp > 0 else 0.0
         if r > worst_ratio:
             worst_ratio = r
@@ -262,7 +274,9 @@ def _analyze_snaps(snaps: list[dict]) -> dict:
     overall_max = max((e["max_contracts"] for e in episodes), default=0.0)
     leftover_contracts = preexisting[0]["max_contracts"] if preexisting else 0.0
 
-    worst_single = _expected_single_qty(worst_ep["price"]) if worst_ep else 0.0
+    # "1 order normal" untuk worst episode — pakai harga episode bila valid, jika tidak
+    # pakai acuan global (tidak pernah lagi tampil 0.0000 selama ada posisi).
+    worst_single = (_expected_single_qty(worst_ep["price"]) if worst_ep else 0.0) or expected_single
 
     return {
         "snapshots_total": len(snaps),
@@ -280,13 +294,15 @@ def _analyze_snaps(snaps: list[dict]) -> dict:
         "worst_new_max_contracts": worst_ep["max_contracts"] if worst_ep else 0.0,
         "worst_new_expected_single": worst_single,
         "stack_new_episodes": stack_new,
+        "reference_price": ref_price,
+        "expected_single": expected_single,
     }
 
 
 # =============================================================================
 # BUILD RECAP
 # =============================================================================
-def _build_recap(start_snap, end_snap, snaps, started_at_epoch, minutes) -> str:
+def _build_recap(start_snap, end_snap, snaps, started_at_epoch, minutes, interval=30.0) -> str:
     snap_stats = _analyze_snaps(snaps)
     log_stats = _analyze_bot_log(_find_bot_log())
 
@@ -299,6 +315,8 @@ def _build_recap(start_snap, end_snap, snaps, started_at_epoch, minutes) -> str:
     wratio = snap_stats["worst_new_ratio"]
     stacking_new = snap_stats["stack_new_episodes"] > 0 or wratio > STACK_RATIO_THRESHOLD
     stacking_log = log_stats["consecutive_entry_dupes"] > 0
+    # Entry dari LOG = ground-truth fine-grained (tahan flip cepat yg luput dari snapshot).
+    log_entries = log_stats["execute_buy"] + log_stats["execute_sell"]
 
     verdict_lines = []
     if snap_stats["preexisting_episodes"] > 0:
@@ -307,10 +325,23 @@ def _build_recap(start_snap, end_snap, snaps, started_at_epoch, minutes) -> str:
             f"sudah terbuka sejak awal observasi (sisa run sebelumnya — DI LUAR scope tes fix)."
         )
 
-    if new_eps == 0:
+    if new_eps == 0 and log_entries > 0:
+        # Snapshot buta terhadap flip cepat: posisi flip < interval, jadi tak pernah
+        # tertangkap momen flat→posisi. Bukan berarti bot diam — LOG yg jadi acuan.
+        dup_log = "🔴 ADA" if stacking_log else "🟢 TIDAK ADA"
+        verdict_lines.append(
+            f"⚪ Snapshot (interval {interval:.0f}s) tidak menangkap episode flat→posisi: "
+            f"posisi flip lebih cepat dari interval. Ini BUKAN tanda bot diam — "
+            f"LOG mencatat {log_entries} entry ({log_stats['execute_buy']} buy / "
+            f"{log_stats['execute_sell']} sell), {log_stats['optimistic_set']} optimistic-set. "
+            f"Duplicate-fire dinilai dari urutan entry log → entry beruntun tanpa close: "
+            f"{log_stats['consecutive_entry_dupes']} ({dup_log})."
+        )
+    elif new_eps == 0:
         verdict_lines.append(
             "⚪ Bot TIDAK membuka posisi baru selama observasi (MA mungkin tidak cross / "
-            "masih mengelola leftover). Tidak ada episode baru untuk uji duplicate-fire."
+            "masih mengelola leftover) DAN log tidak mencatat entry. Tidak ada episode "
+            "baru untuk uji duplicate-fire."
         )
     elif stacking_new:
         verdict_lines.append(
@@ -369,9 +400,13 @@ def _build_recap(start_snap, end_snap, snaps, started_at_epoch, minutes) -> str:
     lines.append(f"- Posisi akhir         : {_summarize_pos(end_snap)}")
     lines.append(f"- Leftover pra-eksisting: {snap_stats['leftover_contracts']:.4f} contracts "
                  f"({snap_stats['preexisting_episodes']} episode, di luar scope)")
-    lines.append(f"- Episode baru (tes)   : {snap_stats['new_episodes']} "
-                 f"(dibuka flat→posisi selama observasi)")
-    lines.append(f"- 1 order normal       : ~{snap_stats['worst_new_expected_single']:.4f} XRP "
+    lines.append(f"- Episode baru (snapshot): {snap_stats['new_episodes']} "
+                 f"(flat→posisi tertangkap snapshot — bisa 0 jika flip < interval)")
+    lines.append(f"- Entry dari log (tes)  : {log_entries} "
+                 f"({log_stats['execute_buy']} buy / {log_stats['execute_sell']} sell) "
+                 f"— ground-truth fine-grained, tahan flip cepat")
+    lines.append(f"- 1 order normal       : ~{snap_stats['expected_single']:.4f} XRP "
+                 f"@ ref {snap_stats['reference_price']:.4f} "
                  f"(ORDER_SIZE_USDT={ORDER_SIZE_USDT} × LEV={LEVERAGE})")
     lines.append(f"- Worst episode baru   : {snap_stats['worst_new_max_contracts']:.4f} contracts "
                  f"= {wratio:.2f}× normal (ambang stacking > {STACK_RATIO_THRESHOLD}×)")
@@ -445,7 +480,7 @@ async def _run(minutes: float, interval: float) -> None:
                   f"pos={_summarize_pos(snap)}{err}")
 
         end_snap = snaps[-1]
-        recap = _build_recap(start_snap, end_snap, snaps, started, minutes)
+        recap = _build_recap(start_snap, end_snap, snaps, started, minutes, interval)
 
         out_path = os.path.join(LOGS_DIR, f"recap_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md")
         with open(out_path, "w", encoding="utf-8") as f:
