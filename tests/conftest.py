@@ -13,11 +13,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-# Pastikan project root ada di sys.path supaya `import strategy` dst jalan,
-# dan engine/ supaya `import position_manager` dst (modul infra) juga jalan.
+# Pastikan di sys.path: project root (config.py), engine/ (modul infra:
+# position_manager, dll), dan user/ (strategy, strategy_ml, tuning_config,
+# backtest_config — dipindah ke user/ saat reorg).
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _ENGINE = os.path.join(_ROOT, "engine")
-for _p in (_ROOT, _ENGINE):
+_USER = os.path.join(_ROOT, "user")
+for _p in (_ROOT, _ENGINE, _USER):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

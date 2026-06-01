@@ -111,7 +111,7 @@ echo.
 echo [START] Menjalankan Trading Bot...
 echo         Tekan Ctrl+C untuk berhenti.
 echo.
-python main.py
+python user\main.py
 pause
 exit /b 0
 
@@ -120,19 +120,19 @@ echo.
 echo [START] Menjalankan Dashboard...
 echo         Buka browser: http://localhost:8501
 echo.
-streamlit run dashboard.py
+streamlit run user\dashboard.py
 pause
 exit /b 0
 
 :RUN_BOTH
 echo.
 echo [START] Menjalankan Bot di window terpisah...
-start "Trading Bot" /D "%~dp0" cmd /k "call .venv\Scripts\activate.bat && python main.py"
+start "Trading Bot" /D "%~dp0" cmd /k "call .venv\Scripts\activate.bat && python user\main.py"
 timeout /t 3 >nul
 echo [START] Menjalankan Dashboard...
 echo         Buka browser: http://localhost:8501
 echo.
-streamlit run dashboard.py
+streamlit run user\dashboard.py
 pause
 exit /b 0
 

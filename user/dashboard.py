@@ -10,8 +10,13 @@
 import os
 import sys
 
-# Tambahkan folder engine/ ke sys.path agar modul infrastruktur bisa di-import flat.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine"))
+# File ini di user/. Tambahkan root (config.py) + root/engine (modul infra) +
+# user/ ke sys.path supaya import flat tetap jalan meski dipindah ke subfolder.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+for _p in (_ROOT, os.path.join(_ROOT, "engine"), _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import time
 import json

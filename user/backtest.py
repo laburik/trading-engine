@@ -15,8 +15,13 @@ import os
 import sys
 import time
 
-# engine/ ke sys.path agar import flat jalan (sama pola main.py / hypertune.py).
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine"))
+# File ini di user/. Tambahkan root (config.py) + root/engine (modul infra) +
+# user/ (strategy, backtest_config) ke sys.path supaya import flat tetap jalan.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+for _p in (_ROOT, os.path.join(_ROOT, "engine"), _HERE):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")

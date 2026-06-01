@@ -5,10 +5,11 @@ import signal
 import time
 import streamlit as st
 
-# Tambahkan root folder + engine/ ke path agar preflight_check (di engine/)
-# bisa di-import flat dari /pages/.
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (_ROOT, os.path.join(_ROOT, "engine")):
+# File ini di user/pages/. Naik 2 level = user/, 3 level = project root.
+# Tambahkan root (config.py) + root/engine (preflight_check) + user/.
+_USER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # user/
+_ROOT = os.path.dirname(_USER)                                        # project root
+for _p in (_ROOT, os.path.join(_ROOT, "engine"), _USER):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 import preflight_check
@@ -23,11 +24,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-BOT_PID_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "logs",
-    "bot_pid.txt"
-)
+BOT_PID_FILE = os.path.join(_ROOT, "logs", "bot_pid.txt")
 
 # =============================================================================
 # Helpers — process management
@@ -66,10 +63,10 @@ def bot_process_running() -> bool:
     return pid is not None and _pid_is_running(pid)
 
 def start_bot():
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Jalankan dari PROJECT ROOT (cwd) supaya logs/ tetap di root; skrip kini di user/.
     proc = subprocess.Popen(
-        [sys.executable, "main.py"],
-        cwd=root,
+        [sys.executable, os.path.join("user", "main.py")],
+        cwd=_ROOT,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,

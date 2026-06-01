@@ -1,11 +1,11 @@
 {
   "include": ["."],
   "exclude": ["**/__pycache__", ".git", "data", "logs", "models"],
-  "extraPaths": ["./engine"],
+  "extraPaths": ["./engine", "./user"],
   "executionEnvironments": [
     {
       "root": ".",
-      "extraPaths": ["./engine"]
+      "extraPaths": ["./engine", "./user"]
     }
   ],
   "reportMissingImports": "warning",

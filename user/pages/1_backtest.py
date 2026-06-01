@@ -1,10 +1,11 @@
 import os
 import sys
 
-# Tambahkan project root dan engine/ ke sys.path supaya import flat tetap jalan
-# meskipun file ini berada di subfolder pages/.
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (_ROOT, os.path.join(_ROOT, "engine")):
+# File ini di user/pages/. Naik 2 level = user/, 3 level = project root.
+# Tambahkan root (config.py) + root/engine (infra) + user/ (import strategy).
+_USER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # user/
+_ROOT = os.path.dirname(_USER)                                        # project root
+for _p in (_ROOT, os.path.join(_ROOT, "engine"), _USER):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
