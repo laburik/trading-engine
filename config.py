@@ -56,7 +56,7 @@ LEVERAGE = 3                  # Leverage multiplier
 ORDER_SIZE_USDT = 2        # Size per trade in USDT (before leverage)
 
 # --- Execution ---
-SLIPPAGE_TOLERANCE = 0.0001    # 0.05% max slippage tolerance
+SLIPPAGE_TOLERANCE = 0.0005    # 0.05% max slippage tolerance
 MAX_RETRY = 3                  # Max order retry attempts
 RETRY_DELAY_MS = 20           # Delay between retries in milliseconds
 CANCEL_ON_PARTIAL = False      # True = cancel remainder on partial fill
