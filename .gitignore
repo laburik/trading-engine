@@ -21,6 +21,7 @@ ENV/
 # ─── DATA YANG DI-GENERATE OTOMATIS (tidak perlu di-push) ────────────────────
 trade_history.csv
 equity_curve.csv
+data/*_bt_*.csv          # cache range backtest CLI (per-user, regenerate otomatis)
 heartbeat.json
 bot_health.json
 bot_pid.txt
