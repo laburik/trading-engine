@@ -58,7 +58,10 @@ def _build_exchange():
         "enableRateLimit": True,
         "options": {
             "defaultType": "linear",
-            "adjustForTimeDifference": False,
+            # Auto-koreksi offset jam lokal vs server + lebarkan toleransi timestamp.
+            # Observer ini yang sebelumnya kena InvalidNonce/10002 saat jam OS drift ~7s.
+            "adjustForTimeDifference": True,
+            "recvWindow": 10000,
         },
     })
     # Bybit Demo Trading endpoint. JANGAN pakai ex.hostname karena CCXT prefix

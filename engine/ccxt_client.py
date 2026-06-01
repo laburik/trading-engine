@@ -30,7 +30,14 @@ exchange = _ExchangeClass({
     "enableRateLimit": True,
     "options": {
         "defaultType":             "linear",   # USDT-perp (Bybit/Binance); exchange lain auto-pilih default
-        "adjustForTimeDifference": False,       # Nonaktifkan panggilan /market/time
+        # Auto-koreksi selisih jam lokal vs server: CCXT tanya jam exchange sekali,
+        # lalu tempel offset ke setiap timestamp request bertanda-tangan. Cegah
+        # InvalidNonce/10002 saat jam OS drift (lihat recv_window di bawah).
+        "adjustForTimeDifference": True,
+        # Toleransi selisih timestamp request vs server (default 5000ms). 10s memberi
+        # margin terhadap drift jam OS / delay event-loop tanpa melemahkan anti-replay
+        # secara berarti untuk trading ritel.
+        "recvWindow":              10000,
     },
 })
 
