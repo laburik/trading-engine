@@ -285,6 +285,22 @@ async def main() -> None:
         logger.info(f"  PnL       : Sync dari Bybit setiap {__import__('config').PNL_SYNC_INTERVAL}s")
     logger.info("=" * 60)
 
+    # ── KONEKTIVITAS PREFLIGHT ─────────────────────────────────────────────────
+    # Cek Bybit merespon SEBELUM apa-apa. Kalau ISP blokir (TLS/DNS) → pesan jelas
+    # + stop, bukan jalan buta dengan candle buffer kosong & best_bid=0.
+    import connectivity
+    from ccxt_client import exchange as _exchange
+    _conn_ok, _conn_msg = await connectivity.probe_bybit_async(_exchange)
+    if not _conn_ok:
+        logger.critical(f"[CONNECTIVITY] {_conn_msg}")
+        print("\n" + "=" * 60)
+        print(f"  ❌ {_conn_msg}")
+        print("=" * 60 + "\n")
+        await close_exchange()
+        sys.exit(1)
+    logger.info(f"[CONNECTIVITY] {_conn_msg}")
+    # ───────────────────────────────────────────────────────────────────────────
+
     # ── CCXT INIT ──────────────────────────────────────────────────────────────
     # Muat market info dari Bybit (diperlukan oleh execution, position_manager, preload)
     await init_exchange()

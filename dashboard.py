@@ -37,6 +37,19 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =============================================================================
+# KONEKTIVITAS BYBIT — banner peringatan kalau ISP memblokir (TLS/DNS)
+# =============================================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def _check_bybit_connectivity() -> tuple[bool, str]:
+    """Probe Bybit (di-cache 60s biar tidak fetch tiap rerun Streamlit)."""
+    import connectivity
+    return connectivity.probe_bybit_sync()
+
+_conn_ok, _conn_msg = _check_bybit_connectivity()
+if not _conn_ok:
+    st.error(f"🚫 {_conn_msg}", icon="🚫")
+
+# =============================================================================
 # DYNAMIC PATH LOADERS
 # =============================================================================
 def _file_signature(folder: str, filename: str) -> float:
