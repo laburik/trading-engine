@@ -9,7 +9,10 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+# config.py ada di user/, tapi .env tetap di project ROOT. Muat eksplisit dari
+# root (robust terhadap cwd maupun lokasi file) supaya API key tetap kebaca.
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
 # =============================================================================
 # config.py — Central Configuration for Trading Bot System

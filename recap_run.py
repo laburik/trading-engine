@@ -38,8 +38,12 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# engine/ ke sys.path (sama pattern main.py / verify_collector)
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine"))
+# engine/ + user/ ke sys.path: engine (deps verify_collector) + user/ (config.py
+# dipindah ke user/ saat reorg).
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+for _p in (os.path.join(_ROOT, "engine"), os.path.join(_ROOT, "user")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 # Reuse mesin exchange + snapshot dari verify_collector (DRY).
 import verify_collector as vc
