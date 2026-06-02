@@ -36,15 +36,24 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from typing import TYPE_CHECKING, Optional
-from config import SYMBOL, MODE, TIMEFRAMES, DATA_MODE
+from config import SYMBOL, MODE, TIMEFRAMES, DATA_MODE, STRATEGY_FILE
 from ccxt_client import init_exchange, close_exchange
 from ft_types import MarketDataSnapshot
 
 # --- Selalu import ---
+import importlib
 import data_stream
 import position_manager
-import strategy
 import strategy_runtime
+
+# Pilih strategi live sesuai config.STRATEGY_FILE (default "strategy"). Boleh ada
+# banyak file strategi di user/ (strategy.py, strategy_ml.py, ...) — cukup arahkan
+# SATU di config.py, sisanya tidak dijalankan. Pola sama dengan backtest & tuning.
+try:
+    strategy = importlib.import_module(STRATEGY_FILE)
+except ModuleNotFoundError:
+    print(f"❌ Strategy '{STRATEGY_FILE}.py' (config.STRATEGY_FILE) tidak ditemukan di user/.")
+    sys.exit(1)
 
 # --- Import modul data sesuai mode ---
 # We use an untyped alias; mypy ignores the conditional re-import via type: ignore.
@@ -281,6 +290,7 @@ async def main() -> None:
     logger.info("=" * 60)
     logger.info(f"  TRADING BOT STARTING")
     logger.info(f"  Symbol    : {SYMBOL}")
+    logger.info(f"  Strategy  : {STRATEGY_FILE}.py")
     logger.info(f"  Mode      : {MODE.upper()}")
     logger.info(f"  Data Mode : {_data_label} ({'Bybit Kline WS' if DATA_MODE == 'kline' else 'Tick-by-Tick Resampler'})")
     if MODE == "paper":
@@ -314,7 +324,7 @@ async def main() -> None:
     # Validasi sintaks, file, library, config, dan strategy sebelum bot jalan.
     # Jika ada error apapun, bot langsung berhenti + tampilkan daftar masalah.
     import preflight_check
-    if not preflight_check.run_and_print():
+    if not preflight_check.run_and_print(STRATEGY_FILE):
         sys.exit(1)
     # ────────────────────────────────────────────────────────────────────────
 

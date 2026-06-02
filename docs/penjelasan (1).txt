@@ -1,4 +1,7 @@
 ada revactor dan strict typing
+mau saya tambahkan fitur cek apakah bisa terima sinyal dari bybit untuk cloudflare.
+
+
 ================================================================
   CATATAN PEMBARUAN SISTEM BOT TRADING
   Tanggal: April 2026
@@ -204,7 +207,3 @@ Jika Anda menulis strategy.py baru, pastikan:
   - Baca/tulis file (open, read_csv) — lebih baik di level modul
   - Strategy agresif yang sering entry
 
-================================================================
-  Semoga membantu! Jalankan: python preflight_check.py
-  untuk memastikan strategy.py Anda siap sebelum live trading.
-================================================================

@@ -160,6 +160,46 @@ def build_data_dict(closed: list[dict], current: dict, tf: str) -> dict:
 
 
 # =============================================================================
+# DEFENSIVE SIGNAL READER
+# =============================================================================
+# Backtest sengaja TIDAK menjalankan pre-flight penuh (itu gerbang khusus live).
+# Tapi return aneh / typo action sebaiknya tetap ketahuan tanpa bikin friksi —
+# jadi kita warning SEKALI saja (dedupe), lalu perlakukan sebagai "hold".
+_VALID_ACTIONS = ("buy", "sell", "close", "hold")
+_signal_warned: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    """Print warning sekali per pesan unik (backtest bisa ratusan ribu iterasi)."""
+    if msg not in _signal_warned:
+        _signal_warned.add(msg)
+        print(f"[WARN] {msg}")
+
+
+def _extract_action(signal: object) -> str:
+    """
+    Ambil 'action' dari return strategy secara defensif.
+    - Bukan dict        → warning + 'hold'
+    - Action tak dikenal → warning + 'hold'
+    """
+    if not isinstance(signal, dict):
+        _warn_once(
+            f"generate_signal() mengembalikan {type(signal).__name__}, bukan dict — "
+            "diperlakukan sebagai 'hold'. Harusnya: {'action': 'hold', 'reason': '...'}."
+        )
+        return "hold"
+    action = signal.get("action", "hold")
+    if action not in _VALID_ACTIONS:
+        _warn_once(
+            f"generate_signal() mengembalikan action tak dikenal: {action!r} — "
+            "diperlakukan sebagai 'hold'. Action valid: buy/sell/close/hold "
+            "(cek kemungkinan typo)."
+        )
+        return "hold"
+    return action
+
+
+# =============================================================================
 # SIMULATOR — SINGLE POSITION (strategy-driven exit, cermin bot live)
 # =============================================================================
 def simulate_single(strategy_module, candles: list[dict], tf: str) -> dict:
@@ -193,7 +233,7 @@ def simulate_single(strategy_module, candles: list[dict], tf: str) -> dict:
         except Exception as e:
             signal = {"action": "hold", "reason": f"err: {e}"}
 
-        action = signal.get("action", "hold")
+        action = _extract_action(signal)
 
         if action == "buy" and _MOCK_STATE["side"] == "none":
             _MOCK_STATE["side"]        = "long"
@@ -353,7 +393,7 @@ def simulate_multi(strategy_module, candles: list[dict], tf: str) -> dict:
         except Exception as e:
             signal = {"action": "hold", "reason": f"err: {e}"}
 
-        action = signal.get("action", "hold")
+        action = _extract_action(signal)
         if action == "buy":
             open_positions.append({"side": "long", "entry_price": close,
                                    "entry_time": t, "qty": notional / close})

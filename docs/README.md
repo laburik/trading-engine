@@ -17,7 +17,7 @@ Bybit (WebSocket / REST, via CCXT Pro)
         └─[DATA_MODE="kline"]─► engine/candle_stream.py   ← Candle instan Bybit Kline WS
                                         │
                                         ▼
-                               strategy.py                 ←  USER EDITS HERE ONLY
+                               user/strategy.py            ←  USER EDIT (default; ganti via STRATEGY_FILE)
                                         │
                                         ▼
                           engine/strategy_runtime.py       ← Orkestrasi: signal → record → execute
@@ -33,11 +33,13 @@ Bybit (WebSocket / REST, via CCXT Pro)
                           engine/trade_logger.py           ← CSV logging (trades + equity)
                                         │
                                         ▼
-                               dashboard.py                ← Streamlit monitoring
+                               user/dashboard.py           ← Streamlit monitoring
 ```
 
-> Modul infrastruktur ada di folder **`engine/`**. `main.py` otomatis menambahkan `engine/`
-> ke `sys.path`, jadi import tetap flat (`import execution`, `import position_manager`, dst).
+> File user-facing ada di folder **`user/`** (`main.py`, `config.py`, `strategy.py`, dst);
+> modul infrastruktur di **`engine/`**. `user/main.py` otomatis menambahkan project root +
+> `engine/` + `user/` ke `sys.path`, jadi import tetap flat (`import execution`,
+> `import position_manager`, dst).
 
 ---
 
@@ -75,6 +77,10 @@ EXCHANGE = "bybit"      # bybit, binance, okx, bitget, ...
 SYMBOL   = "XRPUSDT"
 MODE     = "demo"       # "paper" | "demo" | "live"
 
+# Strategi yang dijalankan live bot — nama file di user/ tanpa .py.
+# Boleh punya banyak file strategi; cukup arahkan SATU di sini.
+STRATEGY_FILE = "strategy"   # mis. "strategy" atau "strategy_ml"
+
 # Mode pengambilan data candle:
 #   "kline" = Bybit native Kline WebSocket (RINGAN, sinkron TradingView)
 #   "tick"  = Tick-by-tick resampler (BERAT, data granular penuh)
@@ -105,9 +111,9 @@ Berguna setelah refactor untuk pastikan tidak ada regresi.
 
 ### 4. Validasi strategy.py
 
-Pre-flight check **berjalan otomatis** saat `python main.py` startup (dan saat klik
+Pre-flight check **berjalan otomatis** saat `python user/main.py` startup (dan saat klik
 **▶️ Start Bot** di Control Panel) — tidak perlu dijalankan manual. Menjalankan pengecekan
-terhadap `strategy.py`, dua level:
+terhadap strategi yang dipilih (`STRATEGY_FILE` di `config.py`, default `strategy.py`), dua level:
 
 | Level | Contoh | Efek |
 |---|---|---|
@@ -120,16 +126,16 @@ terhadap `strategy.py`, dua level:
 ### 5. Run the bot
 
 ```bash
-python main.py
+python user/main.py
 ```
 
-> `main.py` otomatis menjalankan pre-flight check saat startup. **Error fatal** → bot berhenti +
+> `user/main.py` otomatis menjalankan pre-flight check saat startup. **Error fatal** → bot berhenti +
 > tampilkan pesan. **Saran (warning)** → ditampilkan tapi tidak menghentikan bot.
 
 ### 6. Run the dashboard (terminal terpisah)
 
 ```bash
-python -m streamlit run dashboard.py
+python -m streamlit run user/dashboard.py
 ```
 
 Buka: `http://localhost:8501`
@@ -196,7 +202,11 @@ mendokumentasikan apa yang menjaga engine tetap konsisten (terutama di demo/live
 
 ## Cara Edit Strategi
 
-**Kamu HANYA perlu edit `strategy.py`.**
+**Default-nya kamu cukup edit `strategy.py`.** Kalau mau punya beberapa strategi,
+buat file lain (mis. `strategy_ml.py`, `strategy_sqz.py`) lalu arahkan live bot ke
+salah satunya lewat `STRATEGY_FILE` di `config.py` — nama file tanpa `.py`. Backtest
+& tuning juga punya `STRATEGY_FILE` sendiri di config masing-masing, jadi tiap tool
+bisa nunjuk strategi berbeda.
 
 Strategi bebas pakai **Machine Learning** atau **indikator teknikal biasa** — tidak wajib.
 Yang penting, fungsi `generate_signal()` ada dan return format yang benar.
@@ -289,7 +299,7 @@ lewat `tuning_config.py` — tidak ada CLI prompt.
 
 3. **Jalankan**:
    ```bash
-   python hypertune.py
+   python user/hypertune.py
    ```
 
    Program otomatis: download OHLC dari Bybit → save CSV ke `data/` → split 80% in-sample /
@@ -360,7 +370,7 @@ CSV OHLC tersimpan di `data/<SYMBOL>_<TF>_<startdate>_<enddate>.csv`.
 ## Cara Kerja Sistem
 
 ### Historical Candle Preload
-Saat startup, `main.py` mengambil candle historis via Bybit REST (`/v5/market/kline`) untuk semua
+Saat startup, `user/main.py` mengambil candle historis via Bybit REST (`/v5/market/kline`) untuk semua
 timeframe ≥ 1m dan mengisi buffer. Selama proses ini `data["is_warmup"] = True` — strategi
 otomatis return `hold`. Setelah selesai, flag di-set `False` dan bot masuk mode live.
 
@@ -448,10 +458,10 @@ cd /your/project
 pip install -r requirements.txt
 
 # Jalankan bot di background
-nohup python main.py > logs/bot.log 2>&1 &
+nohup python user/main.py > logs/bot.log 2>&1 &
 
 # Jalankan dashboard
-python -m streamlit run dashboard.py
+python -m streamlit run user/dashboard.py
 ```
 
 ---
@@ -460,18 +470,30 @@ python -m streamlit run dashboard.py
 
 ```
 bot/
-├── main.py                  ← Entry point (auto pre-flight; tambah engine/ ke sys.path)
-├── config.py                ← Konfigurasi semua parameter (EXCHANGE, SYMBOL, MODE, DATA_MODE)
-├── strategy.py              ←  USER EDIT DI SINI (cukup tulis generate_signal)
-├── strategy_ml.py           ←  Variant ML (Random Forest + Triple Barrier) — referensi advanced
-├── dashboard.py             ← Streamlit: Live Monitor (halaman utama)
-├── hypertune.py             ← 🔬 Hyperparameter tuning CLI (grid search + 80/20 split)
-├── tuning_config.py         ← 🔬 Konfigurasi tuning
 ├── recap_run.py             ← 🔭 Observer: modal awal → rekap N menit (deteksi duplicate-fire)
 ├── verify_collector.py      ← 🔭 Observer: snapshot Bybit truth → logs/bybit_truth.jsonl
 ├── requirements.txt
 ├── pytest.ini
 ├── .env                     ←  API keys (EXCHANGE_* / BYBIT_*) — JANGAN commit
+│
+├── user/                    ←  USER-FACING (edit di sini)
+│   ├── main.py              ← Entry point (auto pre-flight; tambah root+engine/+user/ ke sys.path)
+│   ├── config.py            ← Konfigurasi akun (EXCHANGE, SYMBOL, MODE, DATA_MODE, STRATEGY_FILE)
+│   ├── strategy.py          ←  USER EDIT DI SINI (default; cukup tulis generate_signal)
+│   ├── strategy_ml.py       ←  Variant ML (Random Forest + Triple Barrier) — referensi advanced
+│   ├── dashboard.py         ← Streamlit: Live Monitor (halaman utama)
+│   ├── backtest.py          ← 📊 Backtest CLI mandiri (PnL + metrik lengkap)
+│   ├── backtest_config.py   ← 📊 Konfigurasi backtest (TIMEFRAME, START/END, STRATEGY_FILE)
+│   ├── hypertune.py         ← 🔬 Hyperparameter tuning CLI (grid search + 80/20 split)
+│   ├── tuning_config.py     ← 🔬 Konfigurasi tuning (STRATEGY_FILE, PARAMS, OPTIM_MODE, ...)
+│   ├── pages/               ← Streamlit multi-page
+│   │   ├── 1_backtest.py      ← Simulasi backtest (Mode Colab & Live)
+│   │   └── 2_control_panel.py ← Start/Stop bot + validasi strategy sebelum run
+│   └── logs/                ← Auto-generated runtime (dibuat saat bot jalan)
+│       ├── heartbeat.json     ← Timestamp bot aktif
+│       ├── bot_health.json    ← Health monitor metrics
+│       ├── trade_history.csv  ← Trade (paper mode)
+│       └── equity_curve.csv   ← Snapshot balance/equity
 │
 ├── engine/                  ←  INFRASTRUKTUR (jarang disentuh user)
 │   ├── data_stream.py       ← WebSocket orderbook + funding + heartbeat (ts_event/ts_init)
@@ -482,38 +504,30 @@ bot/
 │   ├── position_manager.py  ← PnL tracking + optimistic state + sync Bybit
 │   ├── precision.py         ←  Fixed-point Decimal (make_price / make_qty / round_money)
 │   ├── ccxt_client.py       ← Wrapper CCXT Pro (init exchange, demo endpoint)
+│   ├── connectivity.py      ← Probe konektivitas Bybit (deteksi blokir ISP TLS/DNS)
 │   ├── trade_logger.py      ← CSV logging (non-blocking, daemon thread)
 │   ├── bot_monitor.py       ← Health monitor: watchdog, error rate, data quality
-│   ├── preflight_check.py   ← Validator strategy.py (cek error + warning)
-│   ├── backtest.py          ← Engine backtest
+│   ├── preflight_check.py   ← Validator strategi terpilih (config.STRATEGY_FILE)
+│   ├── backtest_core.py     ← Mesin simulasi backtest/tuning (dibagi backtest + hypertune)
+│   ├── backtest_metrics.py  ← Hitung metrik (PnL, win rate, drawdown, profit factor)
+│   ├── backtest_data.py     ← Download + cache candle historis
+│   ├── tuning_core.py       ← Mesin grid-search tuning
 │   └── ft_types.py          ← Pusat definisi TypedDict (single source of truth)
-│
-├── pages/                   ← Streamlit multi-page
-│   ├── 1_backtest.py        ← Simulasi backtest (Mode Colab & Live)
-│   └── 2_control_panel.py   ← Start/Stop bot + validasi strategy sebelum run
 │
 ├── models/                  ← Model ML (opsional — jika tidak ada, strategy jalan tanpa ML)
 │   ├── trading_model_15m.pkl
 │   └── trading_scaler_15m.pkl
 │
-├── tests/                   ←  pytest suite (~376 test) — `python -m pytest`
+├── tests/                   ←  pytest suite — `python -m pytest`
 │   ├── test_execution.py        ← Order fill, in-flight guard, optimistic, stale-data
 │   ├── test_engine_stress.py    ←  Stress/concurrency (race & lockout) — engine
 │   ├── test_precision.py        ←  Fixed-point precision (Decimal)
 │   ├── test_position_manager.py, test_data_stream.py, test_strategy_ml.py, ... (dll)
 │   └── conftest.py
 │
-├── docs/
-│   ├── README.md            ← (file ini)
-│   └── penjelasan (1).txt
-│
-└── logs/                    ← Auto-generated runtime
-    ├── heartbeat.json       ← Timestamp bot aktif
-    ├── bot_health.json      ← Health monitor metrics
-    ├── trade_history.csv    ← Trade (paper mode)
-    ├── equity_curve.csv     ← Snapshot balance/equity
-    ├── bybit_truth.jsonl    ← Snapshot kebenaran Bybit (verify_collector)
-    └── recap_*.md           ← Laporan rekap (recap_run)
+└── docs/
+    ├── README.md            ← (file ini)
+    └── penjelasan (1).txt
 ```
 
 ---

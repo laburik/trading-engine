@@ -77,9 +77,15 @@ def _make_dummy_data(n_candles: int = 100) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # VALIDATOR UTAMA
 # ─────────────────────────────────────────────────────────────────────────────
-def validate_strategy() -> tuple[list[str], list[str]]:
+def validate_strategy(strategy_name: str = "strategy") -> tuple[list[str], list[str]]:
     """
-    Jalankan semua pengecekan terhadap strategy.py.
+    Jalankan semua pengecekan terhadap file strategi yang dipilih.
+
+    Args:
+        strategy_name: nama file strategi tanpa .py (mis. "strategy", "strategy_ml").
+                       Default "strategy". main.py meneruskan config.STRATEGY_FILE
+                       supaya validasi selalu kena ke strategi yang BENAR-BENAR
+                       dijalankan live bot — bukan asal validasi strategy.py.
 
     Returns:
         tuple:
@@ -88,19 +94,21 @@ def validate_strategy() -> tuple[list[str], list[str]]:
     """
     errors   = []
     warnings = []
-    # preflight_check.py ada di engine/, strategy.py ada di project root.
-    # Naik 1 level dari dirname(__file__) supaya ketemu strategy.py user.
-    root   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    fpath  = os.path.join(root, "strategy.py")
+    # preflight_check.py ada di engine/. File strategi user dipindah ke user/
+    # saat reorg, jadi: naik 1 level (project root) lalu masuk ke user/.
+    _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    root   = os.path.join(_project_root, "user")
+    fname  = f"{strategy_name}.py"
+    fpath  = os.path.join(root, fname)
 
     # ------------------------------------------------------------------
     # LANGKAH 1: File strategy.py harus ada
     # ------------------------------------------------------------------
     if not os.path.isfile(fpath):
         errors.append(
-            "[STRATEGY] ❌ File 'strategy.py' tidak ditemukan di:\n"
+            f"[STRATEGY] ❌ File '{fname}' tidak ditemukan di:\n"
             f"   {root}\n"
-            "   Buat file strategy.py terlebih dahulu."
+            f"   Periksa config.STRATEGY_FILE (sekarang = '{strategy_name}') atau buat file {fname}."
         )
         return errors, warnings  # tidak ada gunanya lanjut kalau filenya tidak ada
 
@@ -111,7 +119,7 @@ def validate_strategy() -> tuple[list[str], list[str]]:
     try:
         with open(fpath, "r", encoding="utf-8") as f:
             source = f.read()
-        ast.parse(source, filename="strategy.py")
+        ast.parse(source, filename=fname)
     except SyntaxError as e:
         errors.append(
             f"[STRATEGY] ❌ Syntax Error di baris {e.lineno}:\n"
@@ -135,15 +143,16 @@ def validate_strategy() -> tuple[list[str], list[str]]:
 
     # Hapus cache lama agar strategy di-reload fresh
     for key in list(sys.modules.keys()):
-        if key in ("strategy", "_strategy_ml_cache"):
+        if key in (strategy_name, "_strategy_ml_cache"):
             del sys.modules[key]
 
     if root not in sys.path:
         sys.path.insert(0, root)
 
+    import importlib
     strat = None
     try:
-        import strategy as strat
+        strat = importlib.import_module(strategy_name)
     except SyntaxError as e:
         errors.append(
             f"[STRATEGY] ❌ Syntax Error saat import (baris {e.lineno}):\n"
@@ -164,7 +173,7 @@ def validate_strategy() -> tuple[list[str], list[str]]:
     except Exception as e:
         tb = traceback.format_exc(limit=5)
         errors.append(
-            f"[STRATEGY] ❌ Error saat import strategy.py:\n"
+            f"[STRATEGY] ❌ Error saat import {fname}:\n"
             f"   {type(e).__name__}: {e}\n"
             f"   Detail:\n{tb}"
         )
@@ -180,7 +189,7 @@ def validate_strategy() -> tuple[list[str], list[str]]:
     # ------------------------------------------------------------------
     if not hasattr(strat, "generate_signal"):
         errors.append(
-            "[STRATEGY] ❌ Fungsi 'generate_signal(data)' tidak ditemukan di strategy.py.\n"
+            f"[STRATEGY] ❌ Fungsi 'generate_signal(data)' tidak ditemukan di {fname}.\n"
             "   Pastikan strategy.py punya fungsi ini:\n"
             "   def generate_signal(data: dict) -> dict: ..."
         )
@@ -188,7 +197,7 @@ def validate_strategy() -> tuple[list[str], list[str]]:
 
     if not callable(getattr(strat, "generate_signal")):
         errors.append(
-            "[STRATEGY] ❌ 'generate_signal' di strategy.py bukan sebuah fungsi."
+            f"[STRATEGY] ❌ 'generate_signal' di {fname} bukan sebuah fungsi."
         )
         return errors, warnings
 
@@ -363,7 +372,7 @@ def validate_strategy() -> tuple[list[str], list[str]]:
     # Tidak perlu menjalankan kode — cukup membaca struktur sintaksnya.
     # ------------------------------------------------------------------
     try:
-        _tree = ast.parse(source, filename="strategy.py")
+        _tree = ast.parse(source, filename=fname)
 
         # Temukan node FunctionDef untuk generate_signal
         _gen_node = next(
@@ -452,12 +461,12 @@ def validate_strategy() -> tuple[list[str], list[str]]:
                     _is_exit = True
                 if _is_exit:
                     errors.append(
-                        f"[STRATEGY] ❌ strategy.py memanggil exit/sys.exit/os._exit "
+                        f"[STRATEGY] ❌ {fname} memanggil exit/sys.exit/os._exit "
                         f"(baris {getattr(_n, 'lineno', '?')}).\n"
                         "   Jika exit() dipanggil saat ada posisi terbuka, bot mati\n"
                         "   seketika tanpa sempat menutup posisi — menyebabkan posisi\n"
-                        "   'terparkir' tanpa pengawasan di Bybit.\n"
-                        "   Hapus semua pemanggilan exit() dari strategy.py."
+                        f"   'terparkir' tanpa pengawasan di Bybit.\n"
+                        f"   Hapus semua pemanggilan exit() dari {fname}."
                     )
                     break
 
@@ -532,24 +541,24 @@ def validate_strategy() -> tuple[list[str], list[str]]:
 # =============================================================================
 # run() — entry point untuk main.py
 # =============================================================================
-def run() -> list[str]:
+def run(strategy_name: str = "strategy") -> list[str]:
     """
     Entry point untuk main.py — backward compatible.
     Hanya return errors (blocker). Warnings diabaikan di sini
     karena main.py sudah cukup ketat dengan error fatal saja.
     """
-    errors, _warnings = validate_strategy()
+    errors, _warnings = validate_strategy(strategy_name)
     return errors
 
 
-def run_and_print() -> bool:
+def run_and_print(strategy_name: str = "strategy") -> bool:
     """
     Jalankan validasi dan print hasilnya ke terminal.
     Menampilkan errors (blocker) DAN warnings (saran perbaikan).
     Returns True jika tidak ada error fatal.
     """
-    print("🔍 Memvalidasi strategy.py...")
-    errors, warnings = validate_strategy()
+    print(f"🔍 Memvalidasi {strategy_name}.py...")
+    errors, warnings = validate_strategy(strategy_name)
 
     if warnings:
         print(f"\n⚠️  {len(warnings)} saran perbaikan (bot tetap bisa jalan):")
@@ -576,5 +585,17 @@ def run_and_print() -> bool:
 # =============================================================================
 if __name__ == "__main__":
     import sys as _sys
-    ok = run_and_print()
+    # Standalone (python preflight_check.py): ikut config.STRATEGY_FILE supaya
+    # validasi kena ke strategi yang benar-benar dijalankan live bot. Fallback ke
+    # "strategy" kalau config tidak bisa di-import (dijalankan di luar struktur project).
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _user = os.path.join(os.path.dirname(_here), "user")
+    if _user not in sys.path:
+        sys.path.insert(0, _user)
+    try:
+        import config as _cfg
+        _name = getattr(_cfg, "STRATEGY_FILE", "strategy") or "strategy"
+    except Exception:
+        _name = "strategy"
+    ok = run_and_print(_name)
     _sys.exit(0 if ok else 1)

@@ -25,7 +25,8 @@ def preflight_in_tmpdir(tmp_path, monkeypatch):
     import preflight_check as pf
 
     # Pindah folder kerja preflight_check ke tmp_path/engine/ (via __file__).
-    # validate_strategy() resolves root = dirname(dirname(__file__)), jadi
+    # validate_strategy() resolves project_root = dirname(dirname(__file__)) lalu
+    # root = project_root/user (strategy.py user ada di user/ sejak reorg). Jadi
     # __file__ harus 2 level di bawah project root (mirror struktur asli).
     engine_dir = tmp_path / "engine"
     engine_dir.mkdir(exist_ok=True)
@@ -38,7 +39,9 @@ def preflight_in_tmpdir(tmp_path, monkeypatch):
             del sys.modules[k]
 
     def write_strategy(source: str) -> None:
-        fpath = tmp_path / "strategy.py"
+        user_dir = tmp_path / "user"
+        user_dir.mkdir(exist_ok=True)
+        fpath = user_dir / "strategy.py"
         fpath.write_text(textwrap.dedent(source), encoding="utf-8")
 
     yield pf, write_strategy
@@ -47,10 +50,10 @@ def preflight_in_tmpdir(tmp_path, monkeypatch):
     for k in list(sys.modules.keys()):
         if k in ("strategy", "_strategy_ml_cache"):
             del sys.modules[k]
-    # Hapus tmp_path dari sys.path supaya tidak bocor antar test
-    tmp_str = str(tmp_path)
-    if tmp_str in sys.path:
-        sys.path.remove(tmp_str)
+    # Hapus tmp_path/user dari sys.path supaya tidak bocor antar test
+    user_str = str(tmp_path / "user")
+    if user_str in sys.path:
+        sys.path.remove(user_str)
 
 
 # Strategy "valid" minimum — di-pakai banyak test sebagai baseline

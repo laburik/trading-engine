@@ -53,6 +53,13 @@ CATEGORY = "linear"  # "linear" for USDT-perp, "inverse" for coin-margined
 # "live"  = Live API, uang nyata (perlu API_KEY)
 MODE = "demo"
 
+# --- Strategy ---
+# Nama file strategi yang dijalankan live bot (tanpa .py), diambil dari folder user/.
+# Boleh punya banyak file strategi (mis. strategy.py, strategy_ml.py, strategy_sqz.py)
+# — cukup arahkan ke SATU di sini, sisanya tidak dijalankan.
+# Konvensi sama persis dengan STRATEGY_FILE di backtest_config.py & tuning_config.py.
+STRATEGY_FILE = "strategy"
+
 # --- Account ---
 INITIAL_BALANCE = 1000.0       # Paper trading starting balance (USDT)
 LEVERAGE = 3                  # Leverage multiplier

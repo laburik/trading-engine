@@ -13,6 +13,12 @@ for _p in (_ROOT, os.path.join(_ROOT, "engine"), _USER):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 import preflight_check
+import config
+
+# Strategi yang divalidasi & dijalankan = config.STRATEGY_FILE (default "strategy").
+# Harus konsisten dengan yang dipakai user/main.py supaya UI tidak memvalidasi
+# file yang salah saat user memilih strategi lain.
+_STRATEGY = getattr(config, "STRATEGY_FILE", "strategy")
 
 st.set_page_config(page_title="⚙️ Bot Control", page_icon="⚙️", layout="wide")
 
@@ -127,8 +133,8 @@ with col_stop:
 
 # ── Validasi saat Start diklik ────────────────────────────────────────────────
 if start_clicked:
-    with st.spinner("🔍 Memvalidasi `strategy.py` sebelum bot dijalankan..."):
-        errors, warnings = preflight_check.validate_strategy()
+    with st.spinner(f"🔍 Memvalidasi `{_STRATEGY}.py` sebelum bot dijalankan..."):
+        errors, warnings = preflight_check.validate_strategy(_STRATEGY)
 
     if warnings:
         for i, w in enumerate(warnings, 1):
@@ -139,14 +145,14 @@ if start_clicked:
         # Ada error → tampilkan semua, JANGAN jalankan bot
         st.error(
             f"⛔ **Bot TIDAK dijalankan** — ditemukan **{len(errors)} masalah fatal** "
-            "pada `strategy.py`. Perbaiki sebelum melanjutkan:"
+            f"pada `{_STRATEGY}.py`. Perbaiki sebelum melanjutkan:"
         )
         for i, err in enumerate(errors, 1):
             with st.expander(f"❌ Masalah #{i}", expanded=True):
                 st.code(err, language="text")
     else:
         # Semua OK → jalankan bot
-        st.success("✅ **Validasi berhasil** — semua pengecekan `strategy.py` lolos!")
+        st.success(f"✅ **Validasi berhasil** — semua pengecekan `{_STRATEGY}.py` lolos!")
         with st.spinner("Menyalakan bot..."):
             start_bot()
             time.sleep(1.5)
@@ -158,9 +164,9 @@ st.divider()
 
 # ── Panel Preflight Manual ────────────────────────────────────────────────────
 with st.expander("🔍 Jalankan validasi manual (tanpa Start Bot)", expanded=False):
-    if st.button("Cek strategy.py sekarang", key="manual_check"):
+    if st.button(f"Cek {_STRATEGY}.py sekarang", key="manual_check"):
         with st.spinner("Memvalidasi..."):
-            errors, warnings = preflight_check.validate_strategy()
+            errors, warnings = preflight_check.validate_strategy(_STRATEGY)
 
         if warnings:
             st.warning(f"⚠️ {len(warnings)} saran perbaikan (bot tetap bisa jalan):")
@@ -169,7 +175,7 @@ with st.expander("🔍 Jalankan validasi manual (tanpa Start Bot)", expanded=Fal
                     st.code(w, language="text")
 
         if not errors:
-            st.success("✅ strategy.py **tidak memiliki error fatal**. Siap dijalankan.")
+            st.success(f"✅ {_STRATEGY}.py **tidak memiliki error fatal**. Siap dijalankan.")
         else:
             st.error(f"❌ Ditemukan **{len(errors)} masalah fatal**:")
             for i, err in enumerate(errors, 1):
@@ -182,6 +188,6 @@ st.info("""
 - Bot dijalankan sebagai *background process* terpisah dari Streamlit.
 - Log bot tetap muncul di terminal/file log `main.py`, bukan di sini.
 - Jika bot dikembalikan ke kondisi mati dari luar (Ctrl+C di terminal), tekan **Stop Bot** agar status di-reset.
-- Tombol **Start Bot** akan otomatis memvalidasi `strategy.py` terlebih dahulu sebelum bot dinyalakan.
+- Tombol **Start Bot** akan otomatis memvalidasi strategi terpilih (`config.STRATEGY_FILE`) terlebih dahulu sebelum bot dinyalakan.
 """)
 
