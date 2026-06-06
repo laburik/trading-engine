@@ -72,6 +72,12 @@ RETRY_DELAY_MS = 20           # Delay between retries in milliseconds
 CANCEL_ON_PARTIAL = False      # True = cancel remainder on partial fill
 FEE_RATE = 0.0002              # 0.02% per side (taker fee, applies on leveraged position size)
 
+# --- Backtest realism (HANYA dipakai mesin backtest; tidak memengaruhi live) ---
+# Biaya yang sering luput di backtest → bikin hasil terlalu optimis. Set realistis.
+BACKTEST_SLIPPAGE     = 0.0002   # 0.02% per fill (market order menelusuri book)
+BACKTEST_HALF_SPREAD  = 0.0001   # 0.01% tiap sisi (beli di ask, jual di bid)
+BACKTEST_FUNDING_RATE = 0.0001   # funding perp per 8 jam (drag posisi yang ditahan)
+
 
 # --- Data Stream ---
 ORDERBOOK_DEPTH = 50           # Valid Bybit linear depths: 1, 50, 200, 500

@@ -516,6 +516,27 @@ async def _paper_execute_loop(signal: Signal) -> None:
         await asyncio.sleep(RETRY_DELAY_MS / 1000)
 
 
+# Kode status pasar/simbol Bybit: simbol sedang TIDAK menerima order baru (atau
+# hanya boleh reduce-only). Diatur exchange, BUKAN transient jaringan → retry
+# cepat sia-sia. CCXT 4.5.x memetakan kode-kode ini ke KELAS exception BERBEDA
+# (110074/110063 → ExchangeError, 110023/110042 → InvalidOrder), jadi dideteksi
+# by-CODE dan dipanggil dari beberapa blok except — supaya tahan kalau pemetaan
+# kelas CCXT berubah antar versi.
+_MARKET_STATUS_CODES: tuple[str, ...] = ("110074", "110063", "110023", "110042")
+
+
+def _market_status_reject(err_str: str) -> Optional[OrderResult]:
+    """Return OrderResult 'rejected' (no-retry) kalau error dari status pasar
+    khusus (not-live/settlement/pre-delivery/reduce-only); selain itu None."""
+    if any(code in err_str for code in _MARKET_STATUS_CODES):
+        logger.error(
+            f"[LIVE] Order ditolak: simbol status khusus "
+            f"(not-live/settlement/pre-delivery/reduce-only) — tidak retry: {err_str[:120]}"
+        )
+        return {"status": "rejected", "reason": f"Market status restricted: {err_str[:100]}"}
+    return None
+
+
 async def _live_place_order_async(signal: Signal) -> OrderResult:
     """
     Execute order via CCXT (Bybit REST API, async).
@@ -673,11 +694,21 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
                 logger.warning(f"[LIVE] Bybit reject: insufficient liquidity — book thin")
                 return {"status": "rejected", "reason": f"Insufficient liquidity at Bybit"}
 
+            # Status pasar/simbol (lihat _market_status_reject). Dicek di sini juga
+            # sebagai pengaman kalau CCXT versi lain memetakan kode ini ke BadRequest.
+            market_reject: Optional[OrderResult] = _market_status_reject(err_str)
+            if market_reject is not None:
+                return market_reject
+
             # BadRequest lain — retry sekali, mungkin transient
             logger.warning(f"[LIVE] Order attempt {attempt} BadRequest: {e}")
 
         except ccxt.InvalidOrder as e:
             err_str = str(e)
+            # Status pasar/simbol — CCXT memetakan 110023/110042 ke InvalidOrder.
+            market_reject = _market_status_reject(err_str)
+            if market_reject is not None:
+                return market_reject
             # 110017 = "current position is zero, cannot fix reduce-only order qty"
             # → Bot lokal state desync: kira ada posisi, exchange bilang zero.
             #   Retry sia-sia karena state lokal gak berubah sampai PnL sync next cycle (~2s).
@@ -710,6 +741,16 @@ async def _live_place_order_async(signal: Signal) -> OrderResult:
         except ccxt.AuthenticationError as e:
             logger.error(f"[LIVE] FATAL: Authentication error — cek API key di .env: {e}")
             return {"status": "rejected", "reason": "Authentication failed — invalid API key"}
+
+        except ccxt.ExchangeError as e:
+            # ExchangeError MENTAH (bukan subclass spesifik di atas). CCXT memetakan
+            # 110074/110063 (not-live/settlement) ke sini → fail-fast tanpa retry.
+            # ExchangeError lain diperlakukan transient (retry) seperti sebelumnya.
+            err_str = str(e)
+            market_reject = _market_status_reject(err_str)
+            if market_reject is not None:
+                return market_reject
+            logger.warning(f"[LIVE] Order attempt {attempt} ExchangeError: {type(e).__name__}: {e}")
 
         except Exception as e:
             logger.error(f"[LIVE] Order attempt {attempt} unhandled exception {type(e).__name__}: {e}")

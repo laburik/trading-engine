@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import time
+import math
 import asyncio
 import logging
 from typing import Any, Literal, Union, cast
@@ -291,8 +292,10 @@ def _parse_position_response(positions: list) -> ParsedPositionResult:
         entry_price: float = float(entry_raw)
     except (TypeError, ValueError):
         return ("skip", f"'entryPrice' not numeric: {entry_raw!r}")
-    if entry_price <= 0:
-        return ("skip", f"'entryPrice'={entry_price} not positive")
+    # isfinite WAJIB: float('inf'/'nan') lolos cek `<= 0` (inf>0, nan banding apa pun
+    # False) → entry_price non-finite bisa corrupt state + bikin PnL inf/nan.
+    if not math.isfinite(entry_price) or entry_price <= 0:
+        return ("skip", f"'entryPrice'={entry_price} not finite/positive")
 
     # contracts sudah divalidasi di filter di atas
     contracts_raw = pos.get("contracts")
@@ -300,8 +303,8 @@ def _parse_position_response(positions: list) -> ParsedPositionResult:
         qty: float = float(contracts_raw)
     except (TypeError, ValueError):
         return ("skip", f"'contracts' not numeric: {contracts_raw!r}")
-    if qty <= 0:
-        return ("skip", f"'contracts'={qty} not positive")
+    if not math.isfinite(qty) or qty <= 0:
+        return ("skip", f"'contracts'={qty} not finite/positive")
 
     # unrealizedPnl optional — default 0 kalau tidak ada / invalid (cosmetic field)
     unrealized_raw: Any = pos.get("unrealizedPnl")

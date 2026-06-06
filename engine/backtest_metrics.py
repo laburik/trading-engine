@@ -32,6 +32,10 @@ def compute_metrics(result: dict, initial_balance: float) -> dict:
     else:
         profit_factor = float("inf") if gross_profit > 0 else 0.0
 
+    avg_win  = (gross_profit / len(wins)) if wins else 0.0
+    avg_loss = (sum(t["pnl"] for t in losses) / len(losses)) if losses else 0.0  # <= 0
+    expectancy = (total_pnl / num_trades) if num_trades > 0 else 0.0
+
     if equity_curve:
         eq = np.array(equity_curve, dtype=float)
         running_max = np.maximum.accumulate(eq)
@@ -56,7 +60,7 @@ def compute_metrics(result: dict, initial_balance: float) -> dict:
             if cur_losses > max_consec_losses:
                 max_consec_losses = cur_losses
 
-    if num_trades > 1:
+    if num_trades > 1 and initial_balance > 0:
         returns = np.array([t["pnl"] / initial_balance for t in trades])
         std = returns.std(ddof=1)
         sharpe = float(returns.mean() / std * math.sqrt(num_trades)) if std > 0 else 0.0
@@ -73,6 +77,11 @@ def compute_metrics(result: dict, initial_balance: float) -> dict:
         "num_trades":        num_trades,
         "win_rate":          win_rate,
         "profit_factor":     profit_factor,
+        "gross_profit":      gross_profit,
+        "gross_loss":        gross_loss,
+        "avg_win":           avg_win,
+        "avg_loss":          avg_loss,
+        "expectancy":        expectancy,
         "max_dd_pct":        max_dd_pct,
         "max_consec_wins":   max_consec_wins,
         "max_consec_losses": max_consec_losses,

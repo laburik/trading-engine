@@ -1,3 +1,4 @@
+penambahan tes agar 1.5:1 dari code asli
 ada revactor dan strict typing
 mau saya tambahkan fitur cek apakah bisa terima sinyal dari bybit untuk cloudflare.
 

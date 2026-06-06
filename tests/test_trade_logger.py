@@ -52,6 +52,19 @@ def tl(monkeypatch, tmp_path):
 
     yield _tl
 
+    # Teardown: HENTIKAN writer thread yang mungkin di-spawn importlib.reload di
+    # dalam test. Tanpa ini, tiap reload menambah daemon writer yang tak pernah
+    # mati; semuanya nge-drain _trade_queue GLOBAL yang sama → berebut dengan
+    # TestWriterLoopDrain → flaky (lolos isolasi, gagal di suite penuh). Karena
+    # semua writer poll _shutdown yang sama, set → join thread ter-referensi
+    # membuatnya keluar loop & fungsinya return (daemon mati permanen). Reload
+    # berikutnya me-rebind _writer/_shutdown baru, jadi tak ada akumulasi.
+    _tl._shutdown.set()
+    try:
+        _tl._writer.join(timeout=2)
+    except RuntimeError:
+        pass
+
     # Teardown: bersihkan queue lagi
     while not _tl._trade_queue.empty():
         try:
@@ -219,11 +232,11 @@ class TestWriterLoopDrain:
     def test_drains_trade_queue_to_csv(self, tl, tmp_path, monkeypatch):
         """Run satu iterasi _writer_thread → queue ke-drain ke file."""
         import threading
-        # Pakai path tmp; reload supaya thread baru pakai path baru
-        import importlib
-        importlib.reload(tl)
-        # TestShutdown sebelumnya bisa men-set _shutdown — clear dulu supaya
-        # loop kita di bawah benar-benar iterate sebelum di-stop.
+        # TIDAK reload: reload men-spawn daemon writer baru yang berebut queue
+        # global → akar flakiness. Fixture teardown sudah mematikan writer dari
+        # test sebelumnya, jadi di sini tak ada thread latar yang ikut nge-drain.
+        # _shutdown bisa ke-set oleh test/teardown sebelumnya → clear dulu supaya
+        # loop _writer_thread() benar-benar iterate sekali sebelum di-stop.
         tl._shutdown.clear()
         trade_file = tmp_path / "trades.csv"
         equity_file = tmp_path / "equity.csv"

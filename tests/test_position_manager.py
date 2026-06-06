@@ -270,6 +270,33 @@ class TestParsePositionResponseSkip:
         assert status == "skip"
         assert "side" in payload.lower()
 
+    # Regresi pin: ditemukan hypothesis (entryPrice='INF'). float('inf'/'nan')
+    # lolos cek `<= 0` → harus ditolak via math.isfinite. Tes deterministik di
+    # sini supaya tak bergantung fuzzer kebetulan melempar nilai ini lagi.
+    @pytest.mark.parametrize("bad", ["INF", "inf", "Infinity", "-inf", float("inf"), float("-inf")])
+    def test_infinite_entry_price_returns_skip(self, pm, bad):
+        status, payload = pm._parse_position_response([{
+            "side": "long", "contracts": 1.5, "entryPrice": bad,
+        }])
+        assert status == "skip"
+        assert "finite" in payload.lower() or "entryprice" in payload.lower()
+
+    @pytest.mark.parametrize("bad", ["nan", "NaN", float("nan")])
+    def test_nan_entry_price_returns_skip(self, pm, bad):
+        status, payload = pm._parse_position_response([{
+            "side": "long", "contracts": 1.5, "entryPrice": bad,
+        }])
+        assert status == "skip"
+
+    @pytest.mark.parametrize("bad", ["inf", "Infinity", float("inf")])
+    def test_infinite_contracts_returns_skip(self, pm, bad):
+        # contracts non-finite lolos filter `> 0` (inf>0) → qty=inf harus ditolak juga.
+        status, payload = pm._parse_position_response([{
+            "side": "long", "contracts": bad, "entryPrice": 100.0,
+        }])
+        assert status == "skip"
+        assert "finite" in payload.lower() or "contracts" in payload.lower()
+
 
 # =============================================================================
 # PARSE POSITION — defensive against exchange quirks

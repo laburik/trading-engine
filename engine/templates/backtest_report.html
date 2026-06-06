@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<!--
+  Template laporan backtest (di-render oleh engine/backtest_report.py).
+  Placeholder gaya dollar-NAMA disubstitusi via string.Template.safe_substitute().
+  CSS pakai kurung-kurawal bebas (tidak bentrok dgn placeholder). JANGAN tulis
+  tanda dollar literal di sini. Self-contained: CSS inline, chart inline SVG →
+  bisa dibuka OFFLINE.
+-->
+<html lang="id">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>$TITLE</title>
+<style>
+  :root {
+    --bg:#0f172a; --panel:#1e293b; --panel2:#273449; --line:#334155;
+    --txt:#e2e8f0; --muted:#94a3b8; --pos:#16a34a; --neg:#dc2626; --accent:#38bdf8;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font-family:"Segoe UI",Roboto,Helvetica,Arial,sans-serif; font-size:14px; }
+  .wrap { max-width:960px; margin:0 auto; padding:28px 20px 60px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:22px; }
+  .sub b { color:var(--txt); font-weight:600; }
+  .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-bottom:24px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .card .k { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.4px; }
+  .card .v { font-size:20px; font-weight:700; margin-top:6px; }
+  .pos { color:var(--pos); }
+  .neg { color:var(--neg); }
+  .section { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+             padding:18px 18px 12px; margin-bottom:22px; }
+  .section h2 { font-size:14px; margin:0 0 14px; color:var(--accent);
+                text-transform:uppercase; letter-spacing:.5px; }
+  svg.equity { width:100%; height:auto; display:block; }
+  svg.equity .axis { fill:var(--muted); font-size:11px; }
+  svg.wl { width:100%; height:auto; display:block; border-radius:6px; overflow:hidden; }
+  svg.wl .wl-label { fill:#fff; font-size:13px; font-weight:600; }
+  .empty { color:var(--muted); font-style:italic; padding:14px 2px; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  th, td { text-align:right; padding:7px 10px; border-bottom:1px solid var(--line); }
+  th:nth-child(2), td:nth-child(2), th:last-child, td:last-child { text-align:left; }
+  th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
+  tbody tr:hover { background:var(--panel2); }
+  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:10px 24px; }
+  .stats .row { display:flex; justify-content:space-between; border-bottom:1px solid var(--line);
+                padding:7px 0; }
+  .stats .row span:first-child { color:var(--muted); }
+  footer { color:var(--muted); font-size:12px; text-align:center; margin-top:30px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Laporan Backtest — $SYMBOL $TIMEFRAME</h1>
+  <div class="sub">
+    Range <b>$RANGE</b> &nbsp;•&nbsp; Strategi <b>$STRATEGY</b> &nbsp;•&nbsp;
+    Model <b>$MODEL</b> &nbsp;•&nbsp; Eksekusi <b>$REALISM</b> &nbsp;•&nbsp;
+    Modal awal <b>$INITIAL_BALANCE USDT</b> &nbsp;•&nbsp; dibuat $GENERATED_AT
+  </div>
+
+  <div class="grid">
+    <div class="card"><div class="k">Net PnL (USDT)</div><div class="v $PNL_CLASS">$NET_PNL</div></div>
+    <div class="card"><div class="k">Return</div><div class="v $PNL_CLASS">$NET_PNL_PCT%</div></div>
+    <div class="card"><div class="k">Profit Factor</div><div class="v">$PROFIT_FACTOR</div></div>
+    <div class="card"><div class="k">Max Drawdown</div><div class="v neg">-$MAX_DD%</div></div>
+    <div class="card"><div class="k">Total Trade</div><div class="v">$NUM_TRADES</div></div>
+    <div class="card"><div class="k">Win Rate</div><div class="v">$WIN_RATE%</div></div>
+    <div class="card"><div class="k">Win / Loss</div><div class="v"><span class="pos">$NUM_WINS</span> / <span class="neg">$NUM_LOSSES</span></div></div>
+    <div class="card"><div class="k">Sharpe</div><div class="v">$SHARPE</div></div>
+  </div>
+
+  <div class="section">
+    <h2>Kurva Ekuitas (close-to-close)</h2>
+    $EQUITY_SVG
+  </div>
+
+  <div class="section">
+    <h2>Profit vs Loss</h2>
+    $WINLOSS_SVG
+    <div class="stats" style="margin-top:16px;">
+      <div class="row"><span>Gross Profit</span><span class="pos">$GROSS_PROFIT</span></div>
+      <div class="row"><span>Gross Loss</span><span class="neg">$GROSS_LOSS</span></div>
+      <div class="row"><span>Expectancy/trade</span><span>$EXPECTANCY</span></div>
+      <div class="row"><span>Avg Win</span><span class="pos">$AVG_WIN</span></div>
+      <div class="row"><span>Avg Loss</span><span class="neg">$AVG_LOSS</span></div>
+      <div class="row"><span>Total Fee</span><span>$TOTAL_FEE</span></div>
+      <div class="row"><span>Max Consec Win</span><span class="pos">$MAX_CONSEC_WINS</span></div>
+      <div class="row"><span>Max Consec Loss</span><span class="neg">$MAX_CONSEC_LOSSES</span></div>
+      <div class="row"><span>Saldo Akhir</span><span>$FINAL_BALANCE</span></div>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Riwayat Trade</h2>
+    <table>
+      <thead>
+        <tr><th>#</th><th>Side</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Fee</th><th>Reason</th></tr>
+      </thead>
+      <tbody>
+        $TRADE_ROWS
+      </tbody>
+    </table>
+  </div>
+
+  <footer>Digenerate oleh engine/backtest_report.py — backtest bukan jaminan hasil live.</footer>
+</div>
+</body>
+</html>
