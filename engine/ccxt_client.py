@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import ccxt.pro as ccxt
-from config import ACTIVE_API_KEY, ACTIVE_API_SECRET, MODE, SYMBOL, EXCHANGE
+from config import ACTIVE_API_KEY, ACTIVE_API_SECRET, MODE, SYMBOL, EXCHANGE, LEVERAGE
 
 logger = logging.getLogger("ccxt_client")
 
@@ -133,6 +133,57 @@ async def init_exchange() -> None:
             logger.error(f"[CCXT] Symbol '{SYMBOL}' tidak ditemukan di Bybit markets!")
     except Exception as e:
         logger.error(f"[CCXT] init_exchange() gagal: {e}")
+
+
+async def sync_leverage() -> None:
+    """Samakan leverage AKUN di exchange dengan config.LEVERAGE untuk SYMBOL aktif.
+
+    Bot menentukan ukuran order sebagai notional = ORDER_SIZE_USDT × LEVERAGE.
+    Supaya margin yang dikunci exchange benar-benar = ORDER_SIZE_USDT (sesuai
+    maksud config), leverage akun di exchange HARUS sama dengan config.LEVERAGE.
+    Tanpa sync ini, config & exchange bisa mismatch (mis. config 20x tapi akun
+    masih 1x → bot kirim order besar yang lalu ditolak "insufficient margin").
+
+    - Hanya untuk mode demo/live (paper tidak punya konsep leverage exchange).
+    - HARUS dipanggil SETELAH init_exchange() (butuh unified symbol ter-resolve).
+    - Idempoten: kalau leverage sudah sama, Bybit balas "leverage not modified"
+      (retCode 110043/110010) → diperlakukan SUKSES, bukan error.
+    - Gagal set (mis. melebihi max leverage simbol) → WARNING, bot tetap jalan.
+    """
+    if MODE == "paper":
+        return
+
+    try:
+        sym = get_symbol()
+    except RuntimeError:
+        logger.error(
+            "[CCXT] sync_leverage() dipanggil sebelum symbol ter-resolve "
+            "(init_exchange belum sukses) — leverage tidak di-set."
+        )
+        return
+
+    if not exchange.has.get("setLeverage", False):
+        logger.warning(
+            f"[CCXT] {EXCHANGE} tidak mendukung setLeverage — leverage akun "
+            f"tidak disinkronkan. Set manual di exchange kalau perlu."
+        )
+        return
+
+    try:
+        await exchange.set_leverage(LEVERAGE, sym)
+        logger.info(f"[CCXT] Leverage akun di-set {LEVERAGE}x untuk {sym} (sinkron config).")
+    except Exception as e:
+        msg = str(e).lower()
+        # Leverage sudah sama → Bybit balas error 'not modified' (110043/110010).
+        # Itu artinya kondisi SUDAH benar, bukan kegagalan.
+        if "not modified" in msg or "110043" in msg or "110010" in msg:
+            logger.info(f"[CCXT] Leverage {sym} sudah {LEVERAGE}x — tidak perlu diubah.")
+            return
+        logger.warning(
+            f"[CCXT] Gagal set leverage {LEVERAGE}x untuk {sym}: {type(e).__name__}: {e}. "
+            f"Bot tetap jalan, TAPI leverage akun bisa beda dari config → margin order "
+            f"live mungkin tak sesuai harapan. Set manual di {EXCHANGE} bila perlu."
+        )
 
 
 async def close_exchange() -> None:

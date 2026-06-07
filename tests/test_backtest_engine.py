@@ -625,13 +625,65 @@ class TestValidateConfig:
         with pytest.raises(SystemExit):
             tuning.validate_config()
 
+    def test_strategy_file_with_py_suffix(self, monkeypatch):
+        self._set_valid(monkeypatch)
+        monkeypatch.setattr(tuning.tc, "STRATEGY_FILE", "strategy.py")
+        with pytest.raises(SystemExit):
+            tuning.validate_config()
+
+    def test_param_value_not_list(self, monkeypatch):
+        self._set_valid(monkeypatch)
+        monkeypatch.setattr(tuning.tc, "PARAMS", {"X": 5})   # bukan list
+        with pytest.raises(SystemExit):
+            tuning.validate_config()
+
+    def test_param_value_empty_list(self, monkeypatch):
+        self._set_valid(monkeypatch)
+        monkeypatch.setattr(tuning.tc, "PARAMS", {"X": []})
+        with pytest.raises(SystemExit):
+            tuning.validate_config()
+
+    def test_bad_max_cache_age(self, monkeypatch):
+        self._set_valid(monkeypatch)
+        monkeypatch.setattr(tuning.tc, "MAX_CACHE_AGE_MINUTES", -5, raising=False)
+        with pytest.raises(SystemExit):
+            tuning.validate_config()
+
+
+# =============================================================================
+# tuning_core — validate_params_in_strategy (PARAMS harus ada di strategy file)
+# =============================================================================
+class TestValidateParamsInStrategy:
+    def test_all_present_passes(self, monkeypatch):
+        monkeypatch.setattr(tuning.tc, "STRATEGY_FILE", "strategy", raising=False)
+        strat = types.SimpleNamespace(RSI_PERIOD=14, STOP_LOSS_PCT=0.01)
+        # Tidak raise — semua param ada di strategy.
+        tuning.validate_params_in_strategy(strat, {"RSI_PERIOD": [10, 20, 3]})
+
+    def test_missing_param_exits(self, monkeypatch, capsys):
+        monkeypatch.setattr(tuning.tc, "STRATEGY_FILE", "strategy", raising=False)
+        strat = types.SimpleNamespace(RSI_PERIOD=14)
+        with pytest.raises(SystemExit):
+            tuning.validate_params_in_strategy(strat, {"NOPE_TYPO": [1, 2]})
+        out = capsys.readouterr().out
+        assert "NOPE_TYPO" in out          # sebut param yang salah
+        assert "RSI_PERIOD" in out         # tunjukkan yang tersedia
+
+    def test_defaults_to_tc_params(self, monkeypatch):
+        monkeypatch.setattr(tuning.tc, "STRATEGY_FILE", "strategy", raising=False)
+        monkeypatch.setattr(tuning.tc, "PARAMS", {"GHOST": [1, 2]}, raising=False)
+        strat = types.SimpleNamespace(REAL=1)
+        with pytest.raises(SystemExit):
+            tuning.validate_params_in_strategy(strat)   # pakai tc.PARAMS default
+
 
 # =============================================================================
 # tuning_core — run_grid_search + print_top_results
 # =============================================================================
 def _alternating_strategy():
     """Buy saat flat, close saat in_position → banyak trade deterministik."""
-    sn = types.SimpleNamespace(TF="2h", MIN_CANDLES=0, bot_state={})
+    # DUMMY=0 supaya validate_params_in_strategy lolos (PARAMS test pakai "DUMMY").
+    sn = types.SimpleNamespace(TF="2h", MIN_CANDLES=0, bot_state={}, DUMMY=0)
 
     def gen(data):
         return {"action": "close" if sn.bot_state.get("in_position") else "buy", "reason": "x"}
@@ -647,7 +699,7 @@ def test_run_grid_search(monkeypatch):
     train = make_candles([10 + i for i in range(12)])
     test = make_candles([20 + i for i in range(12)])
     strat = _alternating_strategy()
-    top = tuning.run_grid_search(strat, train, test, ["DUMMY"], [(1,), (2,)])
+    top = tuning.run_grid_search(strat, train, test, ["DUMMY"], [(1,), (2,)], "2h")
     # Harus benar-benar MENEMUKAN kandidat valid (bukan sekadar "list apa pun").
     assert 1 <= len(top) <= tuning.TOP_N_DISPLAY
     best = top[0]
@@ -690,10 +742,11 @@ class TestRunTuning:
 
     def _recording_grid(self, captured):
         """Pengganti run_grid_search yang merekam ukuran split yang diterima."""
-        def fake(strat, train, test, names, combos):
+        def fake(strat, train, test, names, combos, tf, window=None):
             captured["train"] = len(train)
             captured["test"] = len(test)
             captured["combos"] = len(combos)
+            captured["tf"] = tf
             return []
         return fake
 
@@ -708,7 +761,7 @@ class TestRunTuning:
         out = capsys.readouterr().out
         assert "HYPERTUNING" in out
         # Bukti orchestration tuntas, bukan cuma banner:
-        assert captured == {"train": 96, "test": 24, "combos": 2}   # split 80/20 dari 120
+        assert captured == {"train": 96, "test": 24, "combos": 2, "tf": "2h"}  # split 80/20 dari 120
         assert "Tidak ada kombinasi" in out                          # print_top_results([]) jalan di akhir
 
     def test_run_tuning_cache_miss_download(self, monkeypatch, capsys):
@@ -726,7 +779,7 @@ class TestRunTuning:
         out = capsys.readouterr().out
         assert "Downloading" in out
         assert saved["n"] == 1                                       # data hasil download disimpan
-        assert captured == {"train": 96, "test": 24, "combos": 2}    # split benar
+        assert captured == {"train": 96, "test": 24, "combos": 2, "tf": "2h"}  # split benar
         assert "Tidak ada kombinasi" in out
 
     def test_run_tuning_too_few_candles(self, monkeypatch):

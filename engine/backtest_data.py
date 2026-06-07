@@ -83,6 +83,13 @@ def _paginate_ohlcv(ex, ccxt_symbol: str, tf: str, start_ms: int, end_ms: int) -
     """
     Fetch OHLCV via pagination (Bybit/CCXT maks 1000 candle/request).
     Loop maju dari start_ms sampai end_ms. Return raw rows (belum dedup/strip).
+
+    Terminasi via: since >= end_ms (sampai tujuan), batch kosong (habis data),
+    atau next_since tak maju (anti-infinite). SENGAJA TIDAK break saat
+    len(batch) < 1000 — beberapa exchange/TF (mis. Bybit kline 1h/2h) hanya
+    mengembalikan ~999 baris per request walau masih banyak data di depan;
+    break-by-size dulu menghentikan paginasi terlalu dini (cuma ~999 candle →
+    tuning/backtest kekurangan data).
     """
     interval_sec = TF_SECONDS_MAP[tf]
     all_rows: list[list] = []
@@ -96,7 +103,7 @@ def _paginate_ohlcv(ex, ccxt_symbol: str, tf: str, start_ms: int, end_ms: int) -
             break
 
         if not batch:
-            break
+            break  # tidak ada data lagi → selesai
 
         all_rows.extend(batch)
         last_ts: int = int(batch[-1][0])
@@ -104,8 +111,6 @@ def _paginate_ohlcv(ex, ccxt_symbol: str, tf: str, start_ms: int, end_ms: int) -
         if next_since <= since:
             break  # cegah infinite loop kalau exchange return stale data
         since = next_since
-        if len(batch) < 1000:
-            break  # batch terakhir, tidak ada data lagi
 
     return all_rows
 

@@ -37,7 +37,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from typing import TYPE_CHECKING, Optional
 from config import SYMBOL, MODE, TIMEFRAMES, DATA_MODE, STRATEGY_FILE
-from ccxt_client import init_exchange, close_exchange
+from ccxt_client import init_exchange, close_exchange, sync_leverage
 from ft_types import MarketDataSnapshot
 
 # --- Selalu import ---
@@ -318,6 +318,14 @@ async def main() -> None:
     # ── CCXT INIT ──────────────────────────────────────────────────────────────
     # Muat market info dari Bybit (diperlukan oleh execution, position_manager, preload)
     await init_exchange()
+    # ───────────────────────────────────────────────────────────────────────────
+
+    # ── SYNC LEVERAGE ───────────────────────────────────────────────────────────
+    # Samakan leverage akun exchange dengan config.LEVERAGE supaya ukuran order
+    # (ORDER_SIZE_USDT × LEVERAGE) memakai margin sesuai harapan — bukan asal
+    # mengandalkan leverage akun yang mungkin masih beda. No-op di mode paper.
+    if MODE in ("demo", "live"):
+        await sync_leverage()
     # ───────────────────────────────────────────────────────────────────────────
 
     # ── PRE-FLIGHT CHECK ────────────────────────────────────────────────────

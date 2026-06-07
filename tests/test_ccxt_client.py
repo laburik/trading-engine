@@ -96,6 +96,82 @@ class TestInitExchange:
 
 
 # =============================================================================
+# sync_leverage — samakan leverage akun exchange dengan config.LEVERAGE
+# =============================================================================
+class TestSyncLeverage:
+    def test_paper_mode_skips(self, cc, monkeypatch):
+        """Mode paper → tidak ada leverage exchange → set_leverage TIDAK dipanggil."""
+        monkeypatch.setattr(cc, "MODE", "paper")
+        fake_set = AsyncMock()
+        monkeypatch.setattr(cc.exchange, "set_leverage", fake_set, raising=False)
+        asyncio.run(cc.sync_leverage())
+        fake_set.assert_not_awaited()
+
+    def test_sets_leverage_in_live(self, cc, monkeypatch):
+        """Live + symbol ter-resolve → set_leverage dipanggil dengan (LEVERAGE, symbol)."""
+        monkeypatch.setattr(cc, "MODE", "live")
+        monkeypatch.setattr(cc, "_ccxt_symbol", "XRP/USDT:USDT")
+        monkeypatch.setattr(cc.exchange, "has", {"setLeverage": True}, raising=False)
+        fake_set = AsyncMock()
+        monkeypatch.setattr(cc.exchange, "set_leverage", fake_set, raising=False)
+        asyncio.run(cc.sync_leverage())
+        fake_set.assert_awaited_once_with(cc.LEVERAGE, "XRP/USDT:USDT")
+
+    def test_skips_when_symbol_unresolved(self, cc, monkeypatch, caplog):
+        """init_exchange belum sukses (symbol kosong) → skip + log error, no crash."""
+        monkeypatch.setattr(cc, "MODE", "demo")
+        monkeypatch.setattr(cc, "_ccxt_symbol", "")   # belum ter-resolve
+        fake_set = AsyncMock()
+        monkeypatch.setattr(cc.exchange, "set_leverage", fake_set, raising=False)
+        import logging
+        with caplog.at_level(logging.ERROR, logger="ccxt_client"):
+            asyncio.run(cc.sync_leverage())
+        fake_set.assert_not_awaited()
+        assert any("sync_leverage" in rec.message for rec in caplog.records)
+
+    def test_not_supported_skips(self, cc, monkeypatch):
+        """Exchange tanpa setLeverage → skip, set_leverage tidak dipanggil."""
+        monkeypatch.setattr(cc, "MODE", "live")
+        monkeypatch.setattr(cc, "_ccxt_symbol", "XRP/USDT:USDT")
+        monkeypatch.setattr(cc.exchange, "has", {"setLeverage": False}, raising=False)
+        fake_set = AsyncMock()
+        monkeypatch.setattr(cc.exchange, "set_leverage", fake_set, raising=False)
+        asyncio.run(cc.sync_leverage())
+        fake_set.assert_not_awaited()
+
+    def test_already_set_treated_ok(self, cc, monkeypatch, caplog):
+        """Bybit balas 'leverage not modified' → dianggap sukses (info), bukan warning."""
+        monkeypatch.setattr(cc, "MODE", "live")
+        monkeypatch.setattr(cc, "_ccxt_symbol", "XRP/USDT:USDT")
+        monkeypatch.setattr(cc.exchange, "has", {"setLeverage": True}, raising=False)
+
+        async def _not_modified(*a, **k):
+            raise RuntimeError("bybit {\"retCode\":110043} leverage not modified")
+
+        monkeypatch.setattr(cc.exchange, "set_leverage", _not_modified, raising=False)
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ccxt_client"):
+            asyncio.run(cc.sync_leverage())   # tidak boleh raise
+        # Tidak ada WARNING karena 'not modified' = kondisi sudah benar.
+        assert not any(rec.levelno >= logging.WARNING for rec in caplog.records)
+
+    def test_failure_logs_warning_no_crash(self, cc, monkeypatch, caplog):
+        """Error lain (mis. melebihi max leverage) → WARNING, bot tetap jalan."""
+        monkeypatch.setattr(cc, "MODE", "live")
+        monkeypatch.setattr(cc, "_ccxt_symbol", "XRP/USDT:USDT")
+        monkeypatch.setattr(cc.exchange, "has", {"setLeverage": True}, raising=False)
+
+        async def _boom(*a, **k):
+            raise RuntimeError("leverage invalid: exceeds max")
+
+        monkeypatch.setattr(cc.exchange, "set_leverage", _boom, raising=False)
+        import logging
+        with caplog.at_level(logging.WARNING, logger="ccxt_client"):
+            asyncio.run(cc.sync_leverage())   # tidak boleh raise
+        assert any("Gagal set leverage" in rec.message for rec in caplog.records)
+
+
+# =============================================================================
 # close_exchange — tutup koneksi gracefully
 # =============================================================================
 class TestCloseExchange:

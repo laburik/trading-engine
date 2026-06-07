@@ -328,10 +328,16 @@ def _extract_action(signal: object) -> str:
 # SIMULATOR — SINGLE POSITION (strategy-driven exit, cermin bot live)
 # =============================================================================
 def simulate_single(strategy_module, candles: list[dict], tf: str,
-                    subbars: list[list[dict]] | None = None) -> dict:
+                    subbars: list[list[dict]] | None = None,
+                    window: int | None = None) -> dict:
     """Strategy handle entry + exit. Bot live behavior.
     subbars != None → mode realisme 1m (eksekusi/exit intrabar, lihat
-    _simulate_single_detail)."""
+    _simulate_single_detail).
+    window (FAST_TUNING) → kalau >0, strategi tiap bar hanya di-feed `window`
+    candle TERAKHIR (bukan seluruh history). Memangkas perhitungan indikator
+    full-history dari O(n) jadi O(window) per bar → tuning jauh lebih cepat.
+    HANYA aman untuk indikator rolling/konvergen (EMA/SMA/RSI/ATR/Donchian).
+    None/0 = perilaku penuh (default; dipakai backtest.py & live-mirror)."""
     if subbars is not None:
         return _simulate_single_detail(strategy_module, candles, tf, subbars)
     global _MOCK_STATE
@@ -345,6 +351,7 @@ def simulate_single(strategy_module, candles: list[dict], tf: str,
 
     min_warmup = int(getattr(strategy_module, "MIN_CANDLES", 50))
     notional = ORDER_SIZE_USDT * LEVERAGE
+    win = window if window and window > 0 else 0   # FAST_TUNING: candle terakhir yang di-feed
 
     trades: list[dict] = []
     equity_curve: list[float] = []
@@ -352,7 +359,7 @@ def simulate_single(strategy_module, candles: list[dict], tf: str,
 
     for i in range(min_warmup, len(candles)):
         current  = candles[i]
-        closed   = candles[:i]
+        closed   = candles[max(0, i - win):i] if win else candles[:i]
         fill_ref = current["open"]    # fill di OPEN bar berikutnya (bukan close bar sinyal)
         mark     = current["close"]   # harga mark-to-market untuk equity curve
 
@@ -435,12 +442,14 @@ def _get_risk_params(strategy_module) -> tuple[float, float, int]:
 
 
 def simulate_multi(strategy_module, candles: list[dict], tf: str,
-                   subbars: list[list[dict]] | None = None) -> dict:
+                   subbars: list[list[dict]] | None = None,
+                   window: int | None = None) -> dict:
     """
     Tiap "buy"/"sell" → trade independen. Simulator handle SL/TP/TimeStop pakai
     konstanta yang dibaca dari strategy module. "close" diabaikan.
     subbars != None → mode realisme 1m (SL/TP/TimeStop ditelusuri per sub-bar,
     lihat _simulate_multi_detail).
+    window (FAST_TUNING) → lihat simulate_single (feed `window` candle terakhir).
     """
     if subbars is not None:
         return _simulate_multi_detail(strategy_module, candles, tf, subbars)
@@ -454,6 +463,7 @@ def simulate_multi(strategy_module, candles: list[dict], tf: str,
 
     min_warmup = int(getattr(strategy_module, "MIN_CANDLES", 50))
     notional = ORDER_SIZE_USDT * LEVERAGE
+    win = window if window and window > 0 else 0   # FAST_TUNING: candle terakhir yang di-feed
     sl_pct, tp_pct, time_stop_sec = _get_risk_params(strategy_module)
 
     open_positions: list[dict] = []
@@ -463,7 +473,7 @@ def simulate_multi(strategy_module, candles: list[dict], tf: str,
 
     for i in range(min_warmup, len(candles)):
         current = candles[i]
-        closed  = candles[:i]
+        closed  = candles[max(0, i - win):i] if win else candles[:i]
         close   = current["close"]
         high    = current["high"]
         low     = current["low"]

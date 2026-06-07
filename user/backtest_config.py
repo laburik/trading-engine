@@ -10,7 +10,9 @@
 TIMEFRAME = "15m"
 
 # Rentang history (UTC). Format 'YYYY-MM-DD'.
-START = "2026-04-22"     # tanggal mulai
+# Default = awal tahun ini sampai sekarang → mewakili rezim pasar terkini
+# (tempat strategy.py di-tuning untuk profit maksimum).
+START = "2026-01-01"     # tanggal mulai
 END   = "end"            # "end" → data terbaru sampai sekarang; atau "YYYY-MM-DD"
 
 # File strategi yang di-backtest (tanpa .py). Default "strategy" = sama dgn live.
@@ -37,4 +39,4 @@ BACKTEST_REALISM = False
 # Laporan HTML lengkap (riwayat trade, profit vs loss, drawdown, kurva ekuitas
 # SVG, dll). True → generate file .html ke logs/backtest_data/ tiap run.
 # Murni laporan — nol pengaruh ke hasil backtest. Bisa dibuka offline.
-BACKTEST_HTML_REPORT = True
+BACKTEST_HTML_REPORT = False
